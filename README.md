@@ -162,6 +162,12 @@ python3 bench/compare.py --binary build/kvstore --requests 500000 --persistence 
 
 The script starts kvstore and `redis-server` with the same settings, runs `redis-benchmark` against each in turn, and prints a comparison table. It needs `redis-server` and `redis-benchmark` on the `PATH`.
 
+On processors with cores of different speeds, such as phones and tablets, the scheduler can move either server between slow and fast cores from one test to the next, and single runs differ by a factor of two or more. Pin both servers to one fast core and the benchmark client to others, and repeat each test to report the median:
+
+```bash
+python3 bench/compare.py --binary build/kvstore --server-cpu 7 --client-cpus 4,5,6 --repeat 5
+```
+
 ## Project structure
 
 ```

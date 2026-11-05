@@ -6,6 +6,13 @@ runs against one server at a time. Results are printed as a Markdown table and w
 as JSON to bench/results/.
 
     python3 bench/compare.py --binary build-release/kvstore --requests 1000000
+
+On machines with cores of different speeds (big.LITTLE phones and tablets), the scheduler
+can place either server on a slow core for one test and a fast one for the next, which
+makes single runs unrepeatable. Pin the servers and the benchmark client to separate
+fast cores and repeat each test; the table then reports the median of the runs:
+
+    python3 bench/compare.py --server-cpu 7 --client-cpus 4,5,6 --repeat 5
 """
 
 from __future__ import annotations
@@ -14,7 +21,9 @@ import argparse
 import csv
 import io
 import json
+import os
 import platform
+import statistics
 import shutil
 import socket
 import subprocess
@@ -46,12 +55,47 @@ def wait_ready(port: int, process: subprocess.Popen[bytes]) -> None:
     sys.exit(f"server on port {port} did not start")
 
 
-def run_benchmark(port: int, tests: str, requests: int, clients: int, pipeline: int, size: int) -> list[dict]:
+def pinned(cpus: set[int] | None):  # type: ignore[no-untyped-def]
+    """Returns a preexec_fn that restricts the child process to the given CPUs."""
+    if not cpus:
+        return None
+    return lambda: os.sched_setaffinity(0, cpus)
+
+
+def parse_cpus(text: str | None) -> set[int] | None:
+    if not text:
+        return None
+    cpus = {int(c) for c in text.split(",")}
+    available = os.sched_getaffinity(0)
+    if not cpus <= available:
+        sys.exit(f"CPUs {sorted(cpus - available)} are not available to this process (available: {sorted(available)})")
+    return cpus
+
+
+def median_rows(runs: list[list[dict]]) -> list[dict]:
+    rows = []
+    for index, row in enumerate(runs[0]):
+        samples = [run[index] for run in runs]
+        rows.append({
+            "test": row["test"],
+            "rps": statistics.median(r["rps"] for r in samples),
+            "p50_ms": statistics.median(r["p50_ms"] for r in samples),
+            "p99_ms": statistics.median(r["p99_ms"] for r in samples),
+            "rps_runs": [r["rps"] for r in samples],
+        })
+    return rows
+
+
+def run_benchmark(
+    port: int, tests: str, requests: int, clients: int, pipeline: int, size: int, cpus: set[int] | None
+) -> list[dict]:
     command = [
         "redis-benchmark", "-p", str(port), "-t", tests, "-n", str(requests), "-c", str(clients),
         "-P", str(pipeline), "-d", str(size), "-r", "100000", "--csv",
     ]
-    output = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+    output = subprocess.run(
+        command, check=True, capture_output=True, text=True, preexec_fn=pinned(cpus)
+    ).stdout
     rows = []
     for row in csv.DictReader(io.StringIO(output)):
         rows.append({
@@ -72,7 +116,14 @@ def main() -> None:
     parser.add_argument("--pipelines", default="1,16")
     parser.add_argument("--size", type=int, default=64, help="value size in bytes")
     parser.add_argument("--persistence", choices=["none", "everysec", "always"], default="none")
+    parser.add_argument("--server-cpu", help="CPU (or comma-separated CPUs) for both servers")
+    parser.add_argument("--client-cpus", help="comma-separated CPUs for redis-benchmark")
+    parser.add_argument("--repeat", type=int, default=1, help="runs per test; the median is reported")
     args = parser.parse_args()
+    server_cpus = parse_cpus(args.server_cpu)
+    client_cpus = parse_cpus(args.client_cpus)
+    if server_cpus and client_cpus and server_cpus & client_cpus:
+        sys.exit("--server-cpu and --client-cpus must not overlap")
 
     for tool in ("redis-server", "redis-benchmark"):
         if shutil.which(tool) is None:
@@ -91,22 +142,37 @@ def main() -> None:
             for name, command in servers.items():
                 ports[name] = free_port()
                 processes[name] = subprocess.Popen(
-                    [*command, "--port", str(ports[name])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    [*command, "--port", str(ports[name])],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    preexec_fn=pinned(server_cpus),
                 )
                 wait_ready(ports[name], processes[name])
             version = subprocess.run(["redis-server", "--version"], capture_output=True, text=True).stdout.split()[2]
+            runs: dict[str, list[list[dict]]] = {}
             for pipeline in (int(p) for p in args.pipelines.split(",")):
-                for name in servers:
-                    print(f"benchmarking {name}, pipeline {pipeline} ...", file=sys.stderr)
-                    rows = run_benchmark(ports[name], args.tests, args.requests, args.clients, pipeline, args.size)
-                    results[f"{name}/{pipeline}"] = rows
+                # Alternating servers on every repetition spreads slow drifts, such as thermal
+                # throttling, evenly over both.
+                for repetition in range(args.repeat):
+                    for name in servers:
+                        print(f"benchmarking {name}, pipeline {pipeline}, run {repetition + 1}/{args.repeat} ...",
+                              file=sys.stderr)
+                        rows = run_benchmark(
+                            ports[name], args.tests, args.requests, args.clients, pipeline, args.size, client_cpus
+                        )
+                        runs.setdefault(f"{name}/{pipeline}", []).append(rows)
+            results = {key: median_rows(value) for key, value in runs.items()}
         finally:
             for process in processes.values():
                 process.terminate()
                 process.wait()
 
+    pinning = (
+        f", servers on CPU {args.server_cpu}, client on CPUs {args.client_cpus}" if server_cpus or client_cpus else ""
+    )
+    runs_note = f", median of {args.repeat} runs" if args.repeat > 1 else ""
     print(f"\n{args.requests:,} requests per test, {args.clients} clients, {args.size}-byte values, "
-          f"persistence: {args.persistence}, {version.replace('v=', 'Redis ')}\n")
+          f"persistence: {args.persistence}, {version.replace('v=', 'Redis ')}{pinning}{runs_note}\n")
     print("| Test | Pipeline | Redis req/s | kvstore req/s | Ratio | Redis p50 / p99 ms | kvstore p50 / p99 ms |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for pipeline in (int(p) for p in args.pipelines.split(",")):
