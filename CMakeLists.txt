@@ -28,14 +28,19 @@ if(KV_SANITIZE)
 endif()
 
 add_library(kvcore STATIC
+  src/aof.cpp
   src/commands.cpp
   src/database.cpp
   src/glob.cpp
   src/log.cpp
   src/resp.cpp
+  src/server.cpp
   src/siphash.cpp)
 target_include_directories(kvcore PUBLIC src)
 target_link_libraries(kvcore PUBLIC Threads::Threads PRIVATE kv_warnings)
+
+add_executable(kvstore src/main.cpp)
+target_link_libraries(kvstore PRIVATE kvcore kv_warnings)
 
 include(CTest)
 if(BUILD_TESTING)
