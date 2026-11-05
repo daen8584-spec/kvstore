@@ -2,7 +2,7 @@
 
 An in-memory key-value server in C++20 that speaks the Redis protocol, so existing Redis clients, `redis-cli` and `redis-benchmark` work with it unchanged. It implements the core of what makes Redis fast and reliable: a single-threaded event loop with pipelining and backpressure, a hash table that resizes incrementally, key expiry, and append-only file persistence with configurable fsync and compaction in a forked child.
 
-Its behaviour is checked against Redis itself: the protocol and command tests run against both servers. On the same machine its throughput is 0.92 to 1.18 times that of Redis 7 without pipelining.
+Its behaviour is checked against Redis itself: the protocol and command tests pass against both kvstore and Redis. Without pipelining, its throughput is 0.86 to 1.18 times that of Redis on the same machine, measured on x86-64 against Redis 7.0 and on ARM against Redis 8.10.
 
 ## Features
 
@@ -42,7 +42,22 @@ Measured on 2026-11-05 with `bench/compare.py`: `redis-benchmark` with 50 client
 
 Without pipelining both servers are limited by system calls and network round trips, and kvstore is never more than 8% behind Redis and up to 18% ahead. With pipelining the differences grow in both directions. The higher numbers for lists and hashes are a trade-off rather than a better design: Redis stores small lists and hashes in compact encodings that save memory at some cost in speed, while kvstore uses general-purpose containers (`std::deque` and its own hash table) and uses more memory for them. With only 2 vCPUs, `redis-benchmark` competes with the server for CPU, so differences of a few percent are within run-to-run variation. Median latency without pipelining is 0.21 to 0.26 ms for both servers; the full results, including p99, are printed by the script.
 
-Correctness is checked the same way: the 21 protocol and command integration tests pass against both kvstore and Redis 7.
+### ARM tablet
+
+Measured on 2026-11-05 on an Android tablet (MediaTek, four 2.2 GHz and four 3.2 to 3.35 GHz cores) under Termux, against Redis 8.10.3 from the Termux packages: 200,000 requests per test, 50 clients and 64-byte values, without persistence. Both servers ran on the fastest core and `redis-benchmark` on three other fast cores. Each figure is the median of 5 runs, alternating between the servers.
+
+| Test | Redis | kvstore | Ratio | Redis, pipeline 16 | kvstore, pipeline 16 | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SET | 68,213 | 79,523 | 1.17 | 343,643 | 469,484 | 1.37 |
+| GET | 73,638 | 77,730 | 1.06 | 419,287 | 662,252 | 1.58 |
+| INCR | 77,912 | 73,746 | 0.95 | 404,040 | 584,795 | 1.45 |
+| LPUSH | 75,443 | 73,421 | 0.97 | 320,000 | 704,225 | 2.20 |
+| LPOP | 80,096 | 69,037 | 0.86 | 356,506 | 743,494 | 2.09 |
+| HSET | 71,250 | 73,883 | 1.04 | 253,807 | 501,253 | 1.97 |
+
+Pinning was necessary. Without it, identical runs differed by more than a factor of two for both servers, depending on which cores the scheduler chose. Without pipelining, the results match the x86-64 machine: the two servers are within about 15% of each other. With pipelining, system call costs are shared across 16 commands and per-command work dominates. Here kvstore does less than Redis 8: it has no access control checks, per-command statistics and latency histograms, keyspace notifications or compact encodings. That, rather than a faster design, is the likely reason for its lead. Build differences in the Termux package of Redis may also contribute; they were not investigated.
+
+Correctness is checked the same way: the 21 protocol and command integration tests pass against kvstore, Redis 7.0 and Redis 8.10.
 
 ## Architecture
 
