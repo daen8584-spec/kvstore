@@ -1,0 +1,3 @@
+PING
+SET a b EX 10
+TTL a

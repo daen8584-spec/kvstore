@@ -28,6 +28,8 @@ if(KV_SANITIZE)
 endif()
 
 add_library(kvcore STATIC
+  src/commands.cpp
+  src/database.cpp
   src/glob.cpp
   src/log.cpp
   src/resp.cpp
@@ -42,7 +44,24 @@ if(BUILD_TESTING)
     tests/unit/test_dict.cpp
     tests/unit/test_glob.cpp
     tests/unit/test_resp.cpp
-    tests/unit/test_siphash.cpp)
+    tests/unit/test_siphash.cpp
+    tests/unit/test_database.cpp)
   target_link_libraries(unit_tests PRIVATE kvcore kv_warnings)
   add_test(NAME unit COMMAND unit_tests)
+endif()
+
+if(KV_FUZZ)
+  add_executable(fuzz_resp fuzz/fuzz_resp.cpp)
+  target_compile_options(fuzz_resp PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_options(fuzz_resp PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_libraries(fuzz_resp PRIVATE kvcore)
+endif()
+
+# Replays a directory of inputs through the fuzz target logic without libFuzzer,
+# so the corpus also runs under GCC and in ordinary test builds.
+if(BUILD_TESTING)
+  add_executable(fuzz_resp_replay fuzz/fuzz_resp.cpp fuzz/replay_main.cpp)
+  target_compile_definitions(fuzz_resp_replay PRIVATE KV_FUZZ_REPLAY)
+  target_link_libraries(fuzz_resp_replay PRIVATE kvcore)
+  add_test(NAME fuzz_corpus COMMAND fuzz_resp_replay ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus)
 endif()
