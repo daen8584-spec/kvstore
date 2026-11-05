@@ -1,5 +1,7 @@
 # kvstore
 
+[![CI](https://github.com/daen8584-spec/kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/daen8584-spec/kvstore/actions/workflows/ci.yml)
+
 An in-memory key-value server in C++20 that speaks the Redis protocol, so existing Redis clients, `redis-cli` and `redis-benchmark` work with it unchanged. It implements the core of what makes Redis fast and reliable: a single-threaded event loop with pipelining and backpressure, a hash table that resizes incrementally, key expiry, and append-only file persistence with configurable fsync and compaction in a forked child.
 
 Its behaviour is checked against Redis itself: the protocol and command tests pass against both kvstore and Redis. Without pipelining, its throughput is 0.86 to 1.18 times that of Redis on the same machine, measured on x86-64 against Redis 7.0 and on ARM against Redis 8.10.
@@ -210,3 +212,7 @@ docs/adr/         Architecture Decision Records
 - One database (`SELECT 0` only), RESP2 only, and IPv4 only.
 - Not implemented: sets, sorted sets, transactions, publish and subscribe, scripting, replication, clustering, memory limits with eviction, snapshots (RDB) and authentication.
 - Memory is not reported in `INFO`, because the server does not use an instrumented allocator.
+
+## License
+
+[MIT](LICENSE)
