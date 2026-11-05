@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cxx: g++
+          - compiler: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build redis-server python3-pytest
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DKV_WERROR=ON
+          cmake --build build
+      - name: Unit tests and fuzz corpus
+        run: ctest --test-dir build --output-on-failure
+      - name: Integration tests
+        run: cd tests/integration && python3 -m pytest -q
+      - name: Integration tests against redis-server
+        if: matrix.compiler == 'gcc'
+        run: cd tests/integration && KVSTORE_TARGET=redis python3 -m pytest -q
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build python3-pytest
+      # AddressSanitizer fails to map its shadow memory with the runner's default
+      # address space randomization.
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Build with AddressSanitizer and UndefinedBehaviorSanitizer
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DKV_SANITIZE=ON -DKV_WERROR=ON
+          cmake --build build
+      - name: Unit tests and fuzz corpus
+        run: ctest --test-dir build --output-on-failure
+      - name: Integration tests
+        run: |
+          cd tests/integration
+          KVSTORE_BIN=$GITHUB_WORKSPACE/build/kvstore python3 -m pytest -q
+          ! grep -rl "ERROR: AddressSanitizer\|runtime error:" /tmp/pytest-of-*/ 2>/dev/null
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang libclang-rt-18-dev
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Build libFuzzer target
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++ -DKV_FUZZ=ON
+          cmake --build build --target fuzz_resp
+      - name: Fuzz the request parser and commands for two minutes
+        run: |
+          mkdir -p corpus && cp fuzz/corpus/* corpus/
+          ./build/fuzz_resp corpus -max_total_time=120 -max_len=4096 -print_final_stats=1
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: crash-*
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y clang-format
+      - run: clang-format --dry-run --Werror src/*.cpp src/*.hpp tests/unit/*.cpp tests/unit/*.hpp fuzz/*.cpp
