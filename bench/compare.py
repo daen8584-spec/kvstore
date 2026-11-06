@@ -110,7 +110,7 @@ def run_benchmark(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", default="build-release/kvstore")
-    parser.add_argument("--tests", default="set,get,incr,lpush,lpop,hset")
+    parser.add_argument("--tests", default="set,get,incr,lpush,lpop,hset,zadd,zpopmin")
     parser.add_argument("--requests", type=int, default=500_000)
     parser.add_argument("--clients", type=int, default=50)
     parser.add_argument("--pipelines", default="1,16")

@@ -64,15 +64,29 @@ class Dict {
     // value and whether it was inserted.
     template <class... Args>
     std::pair<V*, bool> try_emplace(std::string_view key, Args&&... args) {
+        auto [entry, inserted] = try_emplace_entry(key, std::forward<Args>(args)...);
+        return {&entry->value, inserted};
+    }
+
+    // Like try_emplace, but returns the entry. An entry's address, and therefore its key,
+    // stays the same until it is erased, including across resizes, which move entries
+    // between bucket arrays by relinking them.
+    template <class... Args>
+    std::pair<Entry*, bool> try_emplace_entry(std::string_view key, Args&&... args) {
         if (rehashing()) rehash_step(1);
-        if (Entry* existing = locate(key)) return {&existing->value, false};
+        if (Entry* existing = locate(key)) return {existing, false};
         expand_if_needed();
         Table& table = rehashing() ? tables_[1] : tables_[0];
         const std::size_t index = hash(key) & table.mask();
         auto* entry = new Entry{std::string(key), V(std::forward<Args>(args)...), table.buckets[index]};
         table.buckets[index] = entry;
         ++table.used;
-        return {&entry->value, true};
+        return {entry, true};
+    }
+
+    Entry* find_entry(std::string_view key) {
+        if (rehashing()) rehash_step(1);
+        return locate(key);
     }
 
     bool erase(std::string_view key) {

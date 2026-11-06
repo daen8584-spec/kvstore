@@ -9,7 +9,8 @@ Its behaviour is checked against Redis itself: the protocol and command tests pa
 ## Features
 
 - **Redis protocol (RESP2)**, including pipelining and inline commands, with limits on request sizes
-- **Strings, lists and hashes**: 47 commands, including `SET` with all its options, `SCAN` with `MATCH`, `COUNT` and `TYPE`, and `EXPIRE` with `NX`, `XX`, `GT` and `LT`
+- **Strings, lists, hashes and sorted sets**: 61 commands, including `SET` with all its options, `SCAN` with `MATCH`, `COUNT` and `TYPE`, `EXPIRE` with `NX`, `XX`, `GT` and `LT`, and `ZADD` and `ZRANGE` with their option sets
+- **Sorted sets** on a skip list with ranked links, giving O(log n) rank, range and count queries
 - **Single-threaded epoll event loop** with no locks on the data path, fair reading across clients and backpressure for clients that do not read their replies
 - **Incremental rehashing**: a resize is spread over many operations instead of stalling one request, and keys are hashed with SipHash-1-3 and a random key against hash flooding
 - **Expiry** on access and by Redis-style random sampling, stored as absolute times so it survives restarts
@@ -59,7 +60,18 @@ Measured on 2026-11-05 on an Android tablet (MediaTek, four 2.2 GHz and four 3.2
 
 Pinning was necessary. Without it, identical runs differed by more than a factor of two for both servers, depending on which cores the scheduler chose. Without pipelining, the results match the x86-64 machine: the two servers are within about 15% of each other. With pipelining, system call costs are shared across 16 commands and per-command work dominates. Here kvstore does less than Redis 8: it has no access control checks, per-command statistics and latency histograms, keyspace notifications or compact encodings. That, rather than a faster design, is the likely reason for its lead. Build differences in the Termux package of Redis may also contribute; they were not investigated.
 
-Correctness is checked the same way: the 21 protocol and command integration tests pass against kvstore, Redis 7.0 and Redis 8.10.
+### Sorted sets
+
+Measured on the x86-64 machine with the same settings, median of 3 runs. `ZADD` uses random scores over up to 100,000 members of one sorted set, so most calls move an existing member to a new position.
+
+| Test | Redis | kvstore | Ratio | Redis, pipeline 16 | kvstore, pipeline 16 | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ZADD | 117,897 | 105,175 | 0.89 | 408,163 | 367,918 | 0.90 |
+| ZPOPMIN | 112,892 | 114,705 | 1.02 | 1,440,922 | 1,408,451 | 0.98 |
+
+The first version of `ZADD` reached 0.70 of Redis (0.55 with pipelining). Allocating each skip list node in one block, sharing the member string with the hash table, relinking nodes instead of reallocating them, and looking each member up once closed most of the gap; see [0007](docs/adr/0007-sorted-sets.md).
+
+Correctness is checked the same way: the protocol and command integration tests, including 12 for sorted sets, pass against kvstore and Redis 7.0, and the earlier 21 also against Redis 8.10.
 
 ## Architecture
 
@@ -91,6 +103,7 @@ Documented as [Architecture Decision Records](docs/adr/README.md):
 - [0004](docs/adr/0004-expiry.md) Absolute expiry times with lazy and sampled expiry
 - [0005](docs/adr/0005-append-only-file.md) Append-only file, fsync policies, crash recovery and fork-based compaction
 - [0006](docs/adr/0006-verification.md) Testing against Redis, sanitizers and fuzzing
+- [0007](docs/adr/0007-sorted-sets.md) Sorted sets on a hash table and a ranked skip list
 
 ## Commands
 
@@ -99,6 +112,7 @@ Documented as [Architecture Decision Records](docs/adr/README.md):
 | Strings | `GET` `SET` (`EX` `PX` `EXAT` `PXAT` `NX` `XX` `KEEPTTL` `GET`) `MGET` `MSET` `INCR` `INCRBY` `DECR` `DECRBY` `APPEND` `STRLEN` |
 | Lists | `LPUSH` `RPUSH` `LPOP` `RPOP` (with count) `LLEN` `LRANGE` |
 | Hashes | `HSET` `HGET` `HDEL` `HGETALL` `HLEN` `HEXISTS` |
+| Sorted sets | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZINCRBY` `ZSCORE` `ZCARD` `ZREM` `ZRANK` `ZREVRANK` `ZRANGE` (`BYSCORE` `REV` `LIMIT` `WITHSCORES`) `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZCOUNT` `ZPOPMIN` `ZPOPMAX` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `TTL` `PTTL` `PERSIST` |
 | Server | `PING` `ECHO` `QUIT` `SELECT 0` `DBSIZE` `FLUSHALL` `FLUSHDB` `INFO` `CONFIG GET` `COMMAND` `TIME` `BGREWRITEAOF` |
 
@@ -194,6 +208,7 @@ src/
   commands.*      Command table and implementations
   database.*      Keyspace, expiry tables, lazy and active expiry
   dict.hpp        Hash table with incremental rehashing and SCAN cursors
+  zset.*          Sorted sets: ranked skip list and score parsing
   aof.*           Append-only file, background syncs, loading and rewriting
   resp.*          Incremental request parser and reply encoding
   siphash.*       SipHash-1-3 and SipHash-2-4
@@ -210,7 +225,7 @@ docs/adr/         Architecture Decision Records
 ## Limitations
 
 - One database (`SELECT 0` only), RESP2 only, and IPv4 only.
-- Not implemented: sets, sorted sets, transactions, publish and subscribe, scripting, replication, clustering, memory limits with eviction, snapshots (RDB) and authentication.
+- Not implemented: sets, lexicographic sorted set ranges (`BYLEX`), transactions, publish and subscribe, scripting, replication, clustering, memory limits with eviction, snapshots (RDB) and authentication.
 - Memory is not reported in `INFO`, because the server does not use an instrumented allocator.
 
 ## License

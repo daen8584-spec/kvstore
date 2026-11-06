@@ -5,12 +5,14 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <string>
 
 #include "glob.hpp"
 #include "resp.hpp"
+#include "zset.hpp"
 
 namespace kv {
 namespace {
@@ -587,6 +589,325 @@ void cmd_hexists(ExecContext& ctx, const Args& args) {
     resp::integer(ctx.out, hash->find(args[2]) ? 1 : 0);
 }
 
+// ---- sorted sets ----
+
+constexpr std::string_view kNotFloat = "ERR value is not a valid float";
+
+// Finds a sorted set for writing. Returns nullptr and writes an error when the key holds
+// another type; sets `missing` when the key does not exist.
+ZSet* zset_for_write(ExecContext& ctx, const std::string& key, bool& missing) {
+    Value* value = ctx.db.find(key, ctx.now);
+    missing = value == nullptr;
+    if (!value) return nullptr;
+    auto* zset = std::get_if<ZSet>(value);
+    if (!zset) resp::error(ctx.out, kWrongType);
+    return zset;
+}
+
+void reply_score(std::string& out, double score) {
+    resp::bulk(out, format_score(score));
+}
+
+void zadd_generic(ExecContext& ctx, const Args& args, std::size_t first_pair, bool nx, bool xx, bool gt,
+                  bool lt, bool ch, bool incr) {
+    const std::size_t remaining = args.size() - first_pair;
+    if (remaining == 0 || remaining % 2 != 0) return resp::error(ctx.out, kSyntax);
+    if (nx && xx) return resp::error(ctx.out, "ERR XX and NX options at the same time are not compatible");
+    if ((gt && lt) || ((gt || lt) && nx)) {
+        return resp::error(ctx.out, "ERR GT, LT, and/or NX options at the same time are not compatible");
+    }
+    if (incr && remaining > 2) {
+        return resp::error(ctx.out, "ERR INCR option supports a single increment-element pair");
+    }
+    std::vector<double> scores;
+    for (std::size_t i = first_pair; i < args.size(); i += 2) {
+        double score = 0;
+        if (!parse_score(args[i], score)) return resp::error(ctx.out, kNotFloat);
+        scores.push_back(score);
+    }
+
+    bool missing = false;
+    ZSet* zset = zset_for_write(ctx, args[1], missing);
+    if (!zset && !missing) return;
+
+    if (!zset) {
+        if (xx) return incr ? resp::null_bulk(ctx.out) : resp::integer(ctx.out, 0);
+        zset = &std::get<ZSet>(ctx.db.set(args[1], Value{ZSet{}}));
+    }
+
+    std::int64_t added = 0;
+    std::int64_t updated = 0;
+    std::optional<double> incr_result;
+    bool nan = false;
+    for (std::size_t pair = 0; pair < scores.size() && !nan; ++pair) {
+        const double given = scores[pair];
+        const auto change = zset->upsert(args[first_pair + 2 * pair + 1],
+                                         [&](std::optional<double> existing) -> std::optional<double> {
+                                             if (!existing) {
+                                                 if (xx) return std::nullopt;
+                                                 incr_result = given;
+                                                 return given;
+                                             }
+                                             if (nx) return std::nullopt;
+                                             const double score = incr ? *existing + given : given;
+                                             if (std::isnan(score)) {
+                                                 nan = true;
+                                                 return std::nullopt;
+                                             }
+                                             if ((gt && score <= *existing) || (lt && score >= *existing))
+                                                 return std::nullopt;
+                                             incr_result = score;
+                                             return score;
+                                         });
+        if (change == ZSet::Change::added) ++added;
+        if (change == ZSet::Change::updated) ++updated;
+    }
+    if (zset->empty()) ctx.db.erase(args[1]);
+    if (nan) return resp::error(ctx.out, "ERR resulting score is not a number (NaN)");
+    ctx.dirty = added + updated > 0;
+    if (incr) return incr_result ? reply_score(ctx.out, *incr_result) : resp::null_bulk(ctx.out);
+    resp::integer(ctx.out, ch ? added + updated : added);
+}
+
+void cmd_zadd(ExecContext& ctx, const Args& args) {
+    bool nx = false, xx = false, gt = false, lt = false, ch = false, incr = false;
+    std::size_t i = 2;
+    for (; i < args.size(); ++i) {
+        const std::string& option = args[i];
+        if (iequals(option, "nx"))
+            nx = true;
+        else if (iequals(option, "xx"))
+            xx = true;
+        else if (iequals(option, "gt"))
+            gt = true;
+        else if (iequals(option, "lt"))
+            lt = true;
+        else if (iequals(option, "ch"))
+            ch = true;
+        else if (iequals(option, "incr"))
+            incr = true;
+        else
+            break;
+    }
+    zadd_generic(ctx, args, i, nx, xx, gt, lt, ch, incr);
+}
+
+void cmd_zincrby(ExecContext& ctx, const Args& args) {
+    zadd_generic(ctx, args, 2, false, false, false, false, false, true);
+}
+
+void cmd_zscore(ExecContext& ctx, const Args& args) {
+    Value* value = ctx.db.find(args[1], ctx.now);
+    if (!value) return resp::null_bulk(ctx.out);
+    auto* zset = std::get_if<ZSet>(value);
+    if (!zset) return resp::error(ctx.out, kWrongType);
+    const auto score = zset->score(args[2]);
+    if (score)
+        reply_score(ctx.out, *score);
+    else
+        resp::null_bulk(ctx.out);
+}
+
+void cmd_zcard(ExecContext& ctx, const Args& args) {
+    Value* value = ctx.db.find(args[1], ctx.now);
+    if (!value) return resp::integer(ctx.out, 0);
+    auto* zset = std::get_if<ZSet>(value);
+    if (!zset) return resp::error(ctx.out, kWrongType);
+    resp::integer(ctx.out, static_cast<std::int64_t>(zset->size()));
+}
+
+void cmd_zrem(ExecContext& ctx, const Args& args) {
+    bool missing = false;
+    ZSet* zset = zset_for_write(ctx, args[1], missing);
+    if (!zset) {
+        if (missing) resp::integer(ctx.out, 0);
+        return;
+    }
+    std::int64_t removed = 0;
+    for (std::size_t i = 2; i < args.size(); ++i) removed += zset->erase(args[i]) ? 1 : 0;
+    if (zset->empty()) ctx.db.erase(args[1]);
+    ctx.dirty = removed > 0;
+    resp::integer(ctx.out, removed);
+}
+
+void rank_generic(ExecContext& ctx, const Args& args, bool reverse) {
+    Value* value = ctx.db.find(args[1], ctx.now);
+    if (!value) return resp::null_bulk(ctx.out);
+    auto* zset = std::get_if<ZSet>(value);
+    if (!zset) return resp::error(ctx.out, kWrongType);
+    const auto rank = zset->rank(args[2], reverse);
+    if (rank)
+        resp::integer(ctx.out, static_cast<std::int64_t>(*rank));
+    else
+        resp::null_bulk(ctx.out);
+}
+
+void cmd_zrank(ExecContext& ctx, const Args& args) {
+    rank_generic(ctx, args, false);
+}
+void cmd_zrevrank(ExecContext& ctx, const Args& args) {
+    rank_generic(ctx, args, true);
+}
+
+void reply_nodes(std::string& out, const std::vector<const SkipList::Node*>& nodes, bool with_scores) {
+    resp::array_header(out, nodes.size() * (with_scores ? 2 : 1));
+    for (const SkipList::Node* node : nodes) {
+        resp::bulk(out, node->member);
+        if (with_scores) reply_score(out, node->score);
+    }
+}
+
+std::vector<const SkipList::Node*> nodes_by_index(const ZSet& zset, std::int64_t start, std::int64_t stop,
+                                                  bool reverse) {
+    const auto size = static_cast<std::int64_t>(zset.size());
+    if (start < 0) start = std::max<std::int64_t>(size + start, 0);
+    if (stop < 0) stop = size + stop;
+    stop = std::min(stop, size - 1);
+    std::vector<const SkipList::Node*> nodes;
+    if (start > stop || start >= size) return nodes;
+    const SkipList& list = zset.ordered();
+    // Ranks are 1-based in the skip list; a reversed range starts from the end.
+    const SkipList::Node* node = list.at_rank(static_cast<std::size_t>(reverse ? size - start : start + 1));
+    for (auto i = start; i <= stop && node; ++i) {
+        nodes.push_back(node);
+        node = reverse ? node->prev() : node->next();
+    }
+    return nodes;
+}
+
+std::vector<const SkipList::Node*> nodes_by_score(const ZSet& zset, const ScoreRange& range, bool reverse,
+                                                  std::int64_t offset, std::int64_t count) {
+    std::vector<const SkipList::Node*> nodes;
+    if (offset < 0) return nodes;
+    const SkipList& list = zset.ordered();
+    const SkipList::Node* node = reverse ? list.last_in_range(range) : list.first_in_range(range);
+    for (; node && offset > 0; --offset) node = reverse ? node->prev() : node->next();
+    while (node && count != 0 && (reverse ? range.above_min(node->score) : range.below_max(node->score))) {
+        nodes.push_back(node);
+        if (count > 0) --count;
+        node = reverse ? node->prev() : node->next();
+    }
+    return nodes;
+}
+
+bool parse_range(std::string_view low, std::string_view high, ScoreRange& range) {
+    return parse_score_bound(low, range.min, range.min_exclusive) &&
+           parse_score_bound(high, range.max, range.max_exclusive);
+}
+
+// ZRANGE key start stop [BYSCORE] [REV] [LIMIT offset count] [WITHSCORES], and the older
+// ZREVRANGE, ZRANGEBYSCORE and ZREVRANGEBYSCORE forms, which map onto it.
+void range_generic(ExecContext& ctx, const Args& args, std::size_t options_from, bool by_score,
+                   bool reverse) {
+    bool with_scores = false;
+    bool limited = false;
+    std::int64_t offset = 0;
+    std::int64_t count = -1;
+    for (std::size_t i = options_from; i < args.size(); ++i) {
+        if (iequals(args[i], "withscores")) {
+            with_scores = true;
+        } else if (iequals(args[i], "byscore")) {
+            by_score = true;
+        } else if (iequals(args[i], "rev")) {
+            reverse = true;
+        } else if (iequals(args[i], "limit") && i + 2 < args.size()) {
+            if (!parse_int(args[i + 1], offset) || !parse_int(args[i + 2], count)) {
+                return resp::error(ctx.out, kNotInteger);
+            }
+            limited = true;
+            i += 2;
+        } else {
+            return resp::error(ctx.out, kSyntax);
+        }
+    }
+    if (limited && !by_score) {
+        return resp::error(
+            ctx.out, "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
+    }
+
+    ScoreRange range;
+    std::int64_t start = 0, stop = 0;
+    if (by_score) {
+        // In reverse, the first bound given is the maximum.
+        const bool parsed =
+            reverse ? parse_range(args[3], args[2], range) : parse_range(args[2], args[3], range);
+        if (!parsed) return resp::error(ctx.out, "ERR min or max is not a float");
+    } else if (!parse_int(args[2], start) || !parse_int(args[3], stop)) {
+        return resp::error(ctx.out, kNotInteger);
+    }
+
+    Value* value = ctx.db.find(args[1], ctx.now);
+    if (!value) return resp::array_header(ctx.out, 0);
+    auto* zset = std::get_if<ZSet>(value);
+    if (!zset) return resp::error(ctx.out, kWrongType);
+    const auto nodes = by_score ? nodes_by_score(*zset, range, reverse, offset, count)
+                                : nodes_by_index(*zset, start, stop, reverse);
+    reply_nodes(ctx.out, nodes, with_scores);
+}
+
+void cmd_zrange(ExecContext& ctx, const Args& args) {
+    range_generic(ctx, args, 4, false, false);
+}
+void cmd_zrevrange(ExecContext& ctx, const Args& args) {
+    range_generic(ctx, args, 4, false, true);
+}
+void cmd_zrangebyscore(ExecContext& ctx, const Args& args) {
+    range_generic(ctx, args, 4, true, false);
+}
+void cmd_zrevrangebyscore(ExecContext& ctx, const Args& args) {
+    range_generic(ctx, args, 4, true, true);
+}
+
+void cmd_zcount(ExecContext& ctx, const Args& args) {
+    ScoreRange range;
+    if (!parse_range(args[2], args[3], range)) return resp::error(ctx.out, "ERR min or max is not a float");
+    Value* value = ctx.db.find(args[1], ctx.now);
+    if (!value) return resp::integer(ctx.out, 0);
+    auto* zset = std::get_if<ZSet>(value);
+    if (!zset) return resp::error(ctx.out, kWrongType);
+    // Counted from ranks rather than by walking the range: O(log n) for any range size.
+    const SkipList& list = zset->ordered();
+    const SkipList::Node* first = list.first_in_range(range);
+    if (!first) return resp::integer(ctx.out, 0);
+    const SkipList::Node* last = list.last_in_range(range);
+    const auto count = list.rank(last->score, last->member) - list.rank(first->score, first->member) + 1;
+    resp::integer(ctx.out, static_cast<std::int64_t>(count));
+}
+
+void zpop_generic(ExecContext& ctx, const Args& args, bool max) {
+    if (args.size() > 3) return resp::error(ctx.out, kSyntax);
+    std::int64_t count = 1;
+    if (args.size() == 3 && (!parse_int(args[2], count) || count < 0)) {
+        return resp::error(ctx.out, "ERR value is out of range, must be positive");
+    }
+    bool missing = false;
+    ZSet* zset = zset_for_write(ctx, args[1], missing);
+    if (!zset) {
+        if (missing) resp::array_header(ctx.out, 0);
+        return;
+    }
+    const auto n = std::min<std::size_t>(static_cast<std::size_t>(count), zset->size());
+    resp::array_header(ctx.out, n * 2);
+    std::string member;
+    for (std::size_t i = 0; i < n; ++i) {
+        const SkipList::Node* node = max ? zset->ordered().last() : zset->ordered().first();
+        member = node->member;
+        const double score = node->score;
+        resp::bulk(ctx.out, member);
+        reply_score(ctx.out, score);
+        zset->erase(member);
+    }
+    if (zset->empty()) ctx.db.erase(args[1]);
+    ctx.dirty = n > 0;
+}
+
+void cmd_zpopmin(ExecContext& ctx, const Args& args) {
+    zpop_generic(ctx, args, false);
+}
+void cmd_zpopmax(ExecContext& ctx, const Args& args) {
+    zpop_generic(ctx, args, true);
+}
+
 // clang-format off
 constexpr std::array kCommands = {
     Command{"append", 3, true, cmd_append},
@@ -636,6 +957,20 @@ constexpr std::array kCommands = {
     Command{"ttl", 2, false, cmd_ttl},
     Command{"type", 2, false, cmd_type},
     Command{"unlink", -2, true, cmd_del},
+    Command{"zadd", -4, true, cmd_zadd},
+    Command{"zcard", 2, false, cmd_zcard},
+    Command{"zcount", 4, false, cmd_zcount},
+    Command{"zincrby", 4, true, cmd_zincrby},
+    Command{"zpopmax", -2, true, cmd_zpopmax},
+    Command{"zpopmin", -2, true, cmd_zpopmin},
+    Command{"zrange", -4, false, cmd_zrange},
+    Command{"zrangebyscore", -4, false, cmd_zrangebyscore},
+    Command{"zrank", 3, false, cmd_zrank},
+    Command{"zrem", -3, true, cmd_zrem},
+    Command{"zrevrange", -4, false, cmd_zrevrange},
+    Command{"zrevrangebyscore", -4, false, cmd_zrevrangebyscore},
+    Command{"zrevrank", 3, false, cmd_zrevrank},
+    Command{"zscore", 3, false, cmd_zscore},
 };
 // clang-format on
 

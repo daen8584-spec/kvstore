@@ -10,12 +10,13 @@
 #include <variant>
 
 #include "dict.hpp"
+#include "zset.hpp"
 
 namespace kv {
 
 using List = std::deque<std::string>;
 using Hash = Dict<std::string>;
-using Value = std::variant<std::string, List, Hash>;
+using Value = std::variant<std::string, List, Hash, ZSet>;
 
 const char* type_name(const Value& value);
 

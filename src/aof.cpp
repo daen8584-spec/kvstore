@@ -348,6 +348,17 @@ bool AppendOnlyFile::write_snapshot(const Database& db, int fd, std::int64_t now
                 }
             });
             if (command.size() > 2) emit(command);
+        } else if (const auto* zset = std::get_if<ZSet>(&value)) {
+            command = {"ZADD", key};
+            for (const SkipList::Node* node = zset->ordered().first(); node; node = node->next()) {
+                command.push_back(format_score(node->score));
+                command.emplace_back(node->member);
+                if (command.size() == 2 * kBatch + 2) {
+                    emit(command);
+                    command.resize(2);
+                }
+            }
+            if (command.size() > 2) emit(command);
         }
         if (when) emit({"PEXPIREAT", key, std::to_string(*when)});
     });

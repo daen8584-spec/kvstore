@@ -120,3 +120,21 @@ def test_automatic_rewrite_after_growth(make_server) -> None:  # type: ignore[no
             c.pipeline([("SET", "same", "x" * 1000) for _ in range(200)])
             time.sleep(0.05)
         assert "aof_rewrites:0" not in c.call("INFO", "persistence")
+
+
+def test_sorted_sets_survive_restart_and_rewrite(make_server) -> None:  # type: ignore[no-untyped-def]
+    server = make_server(*AOF, "--auto-aof-rewrite-percentage", "0")
+    with server.client() as c:
+        c.call("ZADD", "z", 1.5, "a", "-inf", "low", 0.1, "tenth", 3, "c")
+        c.call("ZINCRBY", "z", 2, "a")
+        c.call("ZREM", "z", "c")
+    server.restart()
+    with server.client() as c:
+        assert c.call("ZRANGE", "z", 0, -1, "WITHSCORES") == ["low", "-inf", "tenth", "0.1", "a", "3.5"]
+        c.call("BGREWRITEAOF")
+        deadline = time.monotonic() + 10
+        while "aof_rewrite_in_progress:1" in c.call("INFO", "persistence") and time.monotonic() < deadline:
+            time.sleep(0.05)
+    server.restart()
+    with server.client() as c:
+        assert c.call("ZRANGE", "z", 0, -1, "WITHSCORES") == ["low", "-inf", "tenth", "0.1", "a", "3.5"]

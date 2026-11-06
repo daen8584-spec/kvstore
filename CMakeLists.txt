@@ -35,7 +35,8 @@ add_library(kvcore STATIC
   src/log.cpp
   src/resp.cpp
   src/server.cpp
-  src/siphash.cpp)
+  src/siphash.cpp
+  src/zset.cpp)
 target_include_directories(kvcore PUBLIC src)
 target_link_libraries(kvcore PUBLIC Threads::Threads PRIVATE kv_warnings)
 
@@ -50,7 +51,8 @@ if(BUILD_TESTING)
     tests/unit/test_glob.cpp
     tests/unit/test_resp.cpp
     tests/unit/test_siphash.cpp
-    tests/unit/test_database.cpp)
+    tests/unit/test_database.cpp
+    tests/unit/test_zset.cpp)
   target_link_libraries(unit_tests PRIVATE kvcore kv_warnings)
   add_test(NAME unit COMMAND unit_tests)
 endif()
