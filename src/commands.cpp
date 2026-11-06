@@ -17,6 +17,13 @@
 namespace kv {
 namespace {
 
+// Longest piece of client input echoed back in an error message.
+constexpr std::size_t kErrorArgLimit = 128;
+
+std::string clip(std::string_view text, std::size_t limit) {
+    return std::string(text.substr(0, limit));
+}
+
 constexpr std::string_view kWrongType = "WRONGTYPE Operation against a key holding the wrong kind of value";
 constexpr std::string_view kNotInteger = "ERR value is not an integer or out of range";
 constexpr std::string_view kSyntax = "ERR syntax error";
@@ -222,7 +229,7 @@ void expire_generic(ExecContext& ctx, const Args& args, std::int64_t unit_ms, bo
         else if (iequals(args[i], "lt"))
             lt = true;
         else
-            return resp::error(ctx.out, "ERR Unsupported option " + args[i]);
+            return resp::error(ctx.out, "ERR Unsupported option " + clip(args[i], kErrorArgLimit));
     }
     if ((nx && (xx || gt || lt)) || (gt && lt)) {
         return resp::error(ctx.out, "ERR NX and XX, GT or LT options at the same time are not compatible");
@@ -796,9 +803,13 @@ bool parse_range(std::string_view low, std::string_view high, ScoreRange& range)
 }
 
 // ZRANGE key start stop [BYSCORE] [REV] [LIMIT offset count] [WITHSCORES], and the older
-// ZREVRANGE, ZRANGEBYSCORE and ZREVRANGEBYSCORE forms, which map onto it.
-void range_generic(ExecContext& ctx, const Args& args, std::size_t options_from, bool by_score,
-                   bool reverse) {
+// ZREVRANGE, ZRANGEBYSCORE and ZREVRANGEBYSCORE forms, which map onto it. As in Redis,
+// BYSCORE and REV are options of ZRANGE only; the older forms fix both.
+enum class RangeForm { zrange, legacy };
+
+void range_generic(ExecContext& ctx, const Args& args, std::size_t options_from, RangeForm form,
+                   bool by_score, bool reverse) {
+    const bool zrange = form == RangeForm::zrange;
     bool with_scores = false;
     bool limited = false;
     std::int64_t offset = 0;
@@ -806,9 +817,9 @@ void range_generic(ExecContext& ctx, const Args& args, std::size_t options_from,
     for (std::size_t i = options_from; i < args.size(); ++i) {
         if (iequals(args[i], "withscores")) {
             with_scores = true;
-        } else if (iequals(args[i], "byscore")) {
+        } else if (zrange && iequals(args[i], "byscore")) {
             by_score = true;
-        } else if (iequals(args[i], "rev")) {
+        } else if (zrange && iequals(args[i], "rev")) {
             reverse = true;
         } else if (iequals(args[i], "limit") && i + 2 < args.size()) {
             if (!parse_int(args[i + 1], offset) || !parse_int(args[i + 2], count)) {
@@ -846,16 +857,16 @@ void range_generic(ExecContext& ctx, const Args& args, std::size_t options_from,
 }
 
 void cmd_zrange(ExecContext& ctx, const Args& args) {
-    range_generic(ctx, args, 4, false, false);
+    range_generic(ctx, args, 4, RangeForm::zrange, false, false);
 }
 void cmd_zrevrange(ExecContext& ctx, const Args& args) {
-    range_generic(ctx, args, 4, false, true);
+    range_generic(ctx, args, 4, RangeForm::legacy, false, true);
 }
 void cmd_zrangebyscore(ExecContext& ctx, const Args& args) {
-    range_generic(ctx, args, 4, true, false);
+    range_generic(ctx, args, 4, RangeForm::legacy, true, false);
 }
 void cmd_zrevrangebyscore(ExecContext& ctx, const Args& args) {
-    range_generic(ctx, args, 4, true, true);
+    range_generic(ctx, args, 4, RangeForm::legacy, true, true);
 }
 
 void cmd_zcount(ExecContext& ctx, const Args& args) {
@@ -999,15 +1010,24 @@ std::size_t command_count() {
 std::vector<Args> execute(ExecContext& ctx, const Args& args) {
     const Command* command = find_command(args[0]);
     if (command == nullptr) {
-        std::string message = "ERR unknown command '" + args[0] + "', with args beginning with: ";
-        for (std::size_t i = 1; i < args.size() && i <= 3; ++i) message += "'" + args[i] + "' ";
-        resp::error(ctx.out, message);
+        // Client input in the message is capped as in Redis: the name at 128 bytes and
+        // the quoted arguments at about 128 bytes in total.
+        std::string message =
+            "ERR unknown command '" + clip(args[0], kErrorArgLimit) + "', with args beginning with: ";
+        std::string quoted;
+        for (std::size_t i = 1; i < args.size() && quoted.size() < kErrorArgLimit; ++i)
+            quoted += "'" + clip(args[i], kErrorArgLimit - quoted.size()) + "' ";
+        resp::error(ctx.out, message + quoted);
         return {};
     }
     const auto count = static_cast<int>(args.size());
     if ((command->arity > 0 && count != command->arity) || (command->arity < 0 && count < -command->arity)) {
         resp::error(ctx.out,
                     "ERR wrong number of arguments for '" + std::string(command->name) + "' command");
+        return {};
+    }
+    if (command->write && ctx.write_error) {
+        resp::error(ctx.out, "MISCONF Errors writing to the AOF file: " + *ctx.write_error);
         return {};
     }
     ctx.dirty = false;

@@ -56,6 +56,7 @@ def test_zadd_rejects_invalid_input(client: Client) -> None:
         (("INCR", 1, "a", 2, "b"), "INCR option supports a single increment-element pair"),
         (("notanumber", "a"), "not a valid float"),
         (("nan", "a"), "not a valid float"),
+        (("+-5", "a"), "not a valid float"),
     ]:
         with pytest.raises(ReplyError, match=message):
             client.call("ZADD", "z", *args)
@@ -101,6 +102,16 @@ def test_ranges_by_score(board: Client) -> None:
         board.call("ZRANGEBYSCORE", "board", "low", 30)
     with pytest.raises(ReplyError, match="LIMIT is only supported"):
         board.call("ZRANGE", "board", 0, 1, "LIMIT", 0, 1)
+    # BYSCORE and REV are options of ZRANGE only.
+    for command in [
+        ("ZREVRANGE", "board", 0, 1, "REV"),
+        ("ZREVRANGE", "board", 0, 1, "BYSCORE"),
+        ("ZRANGEBYSCORE", "board", 20, 30, "REV"),
+        ("ZRANGEBYSCORE", "board", 20, 30, "BYSCORE"),
+        ("ZREVRANGEBYSCORE", "board", 30, 20, "REV"),
+    ]:
+        with pytest.raises(ReplyError, match="syntax error"):
+            board.call(*command)
 
 
 def test_zcount(board: Client) -> None:

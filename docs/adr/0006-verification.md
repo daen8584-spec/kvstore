@@ -12,7 +12,7 @@ A server written in C++ that parses untrusted network input can fail through mem
 - Unit tests cover the hash table (against a reference map, through growth and shrinking, and SCAN across resizes), the parser (every split point of a request, pipelining, limits, malformed input), glob matching, expiry and command semantics.
 - Integration tests in Python start the real binary and speak RESP over TCP with a minimal client, so they control exactly what is sent. The protocol and command tests also run against `redis-server` (`KVSTORE_TARGET=redis`). A behaviour that differs from Redis therefore fails a test, rather than depending on interpretation.
 - All tests also run with AddressSanitizer and UndefinedBehaviorSanitizer.
-- A libFuzzer target feeds arbitrary bytes through the parser and every command, split across two reads, and checks parser invariants and that every command produces exactly one well-formed reply. CI fuzzes for two minutes on every push, and the seed corpus runs as a regression test with any compiler.
+- A libFuzzer target feeds arbitrary bytes through the parser and every command, split across two reads, and checks parser invariants and that every command produces exactly one well-formed reply. It parses the output as RESP2 and fails unless it is exactly one complete reply, which catches errors that echo client bytes and split into several replies. CI fuzzes for two minutes on every push, and the seed corpus runs as a regression test with any compiler.
 - CI builds with GCC and Clang with warnings as errors, and checks formatting.
 
 ## Consequences

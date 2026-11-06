@@ -71,7 +71,7 @@ void write(Level level, std::string_view message) {
     line += ' ';
     line += message;
     line += '\n';
-    // A single write keeps lines from the server and a rewrite child from interleaving.
+    // One write per line, so a line is never split by output from elsewhere.
     [[maybe_unused]] const ssize_t written = ::write(STDERR_FILENO, line.data(), line.size());
 }
 

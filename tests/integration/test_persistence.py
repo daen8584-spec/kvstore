@@ -1,7 +1,11 @@
+import resource
 import signal
+import socket
 import time
 
 import pytest
+
+from resp_client import ReplyError
 
 pytestmark = pytest.mark.kvstore_only
 
@@ -45,16 +49,18 @@ def test_acknowledged_writes_survive_a_crash(make_server) -> None:  # type: igno
 
 
 def test_expiry_is_stored_as_absolute_time(make_server) -> None:  # type: ignore[no-untyped-def]
+    # Time that passes while the server is down counts towards expiry. The checks hold
+    # however long the restart takes, so they do not depend on the machine's speed.
     server = make_server(*AOF)
     with server.client() as c:
-        c.call("SET", "k", "v", "PX", 1500)
-    time.sleep(1.0)
-    server.restart()
+        c.call("SET", "short", "v", "PX", 1500)
+        c.call("SET", "long", "v", "PX", 60_000)
+    server.stop()
+    time.sleep(2.0)
+    server.start()
     with server.client() as c:
-        assert 0 < c.call("PTTL", "k") <= 500
-    time.sleep(0.6)
-    with server.client() as c:
-        assert c.call("GET", "k") is None
+        assert c.call("EXISTS", "short") == 0
+        assert 0 < c.call("PTTL", "long") <= 58_000
 
 
 def test_truncated_tail_is_discarded(make_server) -> None:  # type: ignore[no-untyped-def]
@@ -138,3 +144,55 @@ def test_sorted_sets_survive_restart_and_rewrite(make_server) -> None:  # type: 
     server.restart()
     with server.client() as c:
         assert c.call("ZRANGE", "z", 0, -1, "WITHSCORES") == ["low", "-inf", "tenth", "0.1", "a", "3.5"]
+
+
+def limit_file_size(limit: int):  # type: ignore[no-untyped-def]
+    """Makes writes beyond `limit` bytes fail in the server, like a full disk.
+
+    A write that crosses the limit is cut short and the next one fails with EFBIG, so this
+    also covers partial writes. SIGXFSZ is ignored so the failure is reported to the
+    server instead of terminating it.
+    """
+
+    def apply() -> None:
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit, resource.RLIM_INFINITY))
+
+    return apply
+
+
+def test_failed_append_holds_the_reply_and_refuses_writes(make_server) -> None:  # type: ignore[no-untyped-def]
+    server = make_server(*AOF, preexec=limit_file_size(4096))
+    aof = server.directory / "appendonly.aof"
+    with server.client() as writer, server.client() as other:
+        writer.call("SET", "small", "1")
+        size = aof.stat().st_size
+        # Crosses the limit: part of the command is written, then the write fails.
+        writer.send_raw(b"*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n$8000\r\n" + b"x" * 8000 + b"\r\n")
+        writer.sock.settimeout(0.5)
+        with pytest.raises(socket.timeout):
+            writer.read_reply()  # not acknowledged while it is not in the file
+        writer.sock.settimeout(5)
+
+        # Other clients are served, but writes are refused until the file can be written.
+        with pytest.raises(ReplyError, match="MISCONF"):
+            other.call("SET", "refused", "1")
+        assert other.call("GET", "small") == "1"
+        assert "aof_last_write_status:err" in other.call("INFO", "persistence")
+        assert aof.stat().st_size == size  # the short write was cut back
+
+        # Space becomes available: the held write goes through and is acknowledged.
+        assert server.process is not None
+        unlimited = (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+        resource.prlimit(server.process.pid, resource.RLIMIT_FSIZE, unlimited)
+        assert writer.read_reply() == "OK"
+        assert "aof_last_write_status:ok" in other.call("INFO", "persistence")
+        assert other.call("SET", "after", "1") == "OK"
+
+    server.preexec = None
+    server.restart()
+    with server.client() as c:
+        assert c.call("GET", "small") == "1"
+        assert c.call("STRLEN", "big") == 8000
+        assert c.call("GET", "after") == "1"
+        assert c.call("EXISTS", "refused") == 0

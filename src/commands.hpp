@@ -36,6 +36,9 @@ struct ExecContext {
     bool dirty = false;
     std::vector<Args> propagate;
     bool close_connection = false;
+    // Set while the append-only file cannot be written; write commands are then refused
+    // with this reason.
+    const std::string* write_error = nullptr;
 };
 
 struct Command {

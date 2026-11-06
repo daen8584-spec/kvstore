@@ -14,8 +14,8 @@ Its behaviour is checked against Redis itself: the protocol and command tests pa
 - **Single-threaded epoll event loop** with no locks on the data path, fair reading across clients and backpressure for clients that do not read their replies
 - **Incremental rehashing**: a resize is spread over many operations instead of stalling one request, and keys are hashed with SipHash-1-3 and a random key against hash flooding
 - **Expiry** on access and by Redis-style random sampling, stored as absolute times so it survives restarts
-- **Append-only file persistence** with `always`, `everysec` and `no` fsync policies, syncs on a worker thread, recovery from a truncated tail, and compaction in a forked child while the server keeps serving
-- **Verified** with unit and integration tests, the same integration tests run against Redis, AddressSanitizer and UndefinedBehaviorSanitizer, and continuous fuzzing
+- **Append-only file persistence** with `always`, `everysec` and `no` fsync policies, syncs on a worker thread, no acknowledgement and a `MISCONF` error for writes while the disk is full, recovery from a truncated tail, and compaction in a forked child while the server keeps serving
+- **Verified** with unit and integration tests, the same integration tests run against Redis, AddressSanitizer and UndefinedBehaviorSanitizer, and two minutes of fuzzing on every push
 
 ## Results
 
@@ -43,7 +43,7 @@ Measured on 2026-11-05 with `bench/compare.py`: `redis-benchmark` with 50 client
 | LPOP | 109,194 | 112,385 | 1.03 | 883,392 | 1,131,222 | 1.28 |
 | HSET | 125,597 | 115,128 | 0.92 | 445,633 | 674,764 | 1.51 |
 
-Without pipelining both servers are limited by system calls and network round trips, and kvstore is never more than 8% behind Redis and up to 18% ahead. With pipelining the differences grow in both directions. The higher numbers for lists and hashes are a trade-off rather than a better design: Redis stores small lists and hashes in compact encodings that save memory at some cost in speed, while kvstore uses general-purpose containers (`std::deque` and its own hash table) and uses more memory for them. With only 2 vCPUs, `redis-benchmark` competes with the server for CPU, so differences of a few percent are within run-to-run variation. Median latency without pipelining is 0.21 to 0.26 ms for both servers; the full results, including p99, are printed by the script.
+Without pipelining both servers are limited by system calls and network round trips, and for these commands kvstore is between 8% behind Redis and 18% ahead; sorted sets are measured separately below. With pipelining the differences grow in both directions. The higher numbers for lists and hashes are a trade-off rather than a better design: Redis stores small lists and hashes in compact encodings that save memory at some cost in speed, while kvstore uses general-purpose containers (`std::deque` and its own hash table) and uses more memory for them. With only 2 vCPUs, `redis-benchmark` competes with the server for CPU, so differences of a few percent are within run-to-run variation. Median latency without pipelining is 0.21 to 0.26 ms for both servers; the full results, including p99, are printed by the script.
 
 ### ARM tablet
 
@@ -69,9 +69,11 @@ Measured on the x86-64 machine with the same settings, median of 3 runs. `ZADD` 
 | ZADD | 117,897 | 105,175 | 0.89 | 408,163 | 367,918 | 0.90 |
 | ZPOPMIN | 112,892 | 114,705 | 1.02 | 1,440,922 | 1,408,451 | 0.98 |
 
+A sorted set with one member takes about 470 bytes of memory including its key, measured as the server's resident memory over 100,000 such sets.
+
 The first version of `ZADD` reached 0.70 of Redis (0.55 with pipelining). Allocating each skip list node in one block, sharing the member string with the hash table, relinking nodes instead of reallocating them, and looking each member up once closed most of the gap; see [0007](docs/adr/0007-sorted-sets.md).
 
-Correctness is checked the same way: the protocol and command integration tests, including 12 for sorted sets, pass against kvstore and Redis 7.0, and the earlier 21 also against Redis 8.10.
+Correctness is checked the same way: the protocol and command integration tests, including 12 for sorted sets, pass against kvstore and Redis 7.0.15. The tests that existed before sorted sets were added also pass against Redis 8.10.3; the sorted set tests have not been run against Redis 8.
 
 ## Architecture
 

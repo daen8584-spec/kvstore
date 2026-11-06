@@ -65,6 +65,9 @@ class Server final : public ServerControl {
         bool queued_for_write = false;
         bool close_after_reply = false;
         bool reading_paused = false;
+        // Position in the append-only file of this client's last write. Its replies are
+        // sent only once the file has been written up to there.
+        std::uint64_t aof_position = 0;
     };
 
     bool setup(std::string& error);

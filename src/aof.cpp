@@ -7,6 +7,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 
 #include "log.hpp"
@@ -14,16 +15,24 @@
 namespace kv {
 namespace {
 
-bool write_all(int fd, std::string_view data) {
-    while (!data.empty()) {
-        const ssize_t n = ::write(fd, data.data(), data.size());
+// Writes all of data. On failure, `written` is how much reached the file before the
+// error, which may be part of a command.
+bool write_all(int fd, std::string_view data, std::size_t& written) {
+    written = 0;
+    while (written < data.size()) {
+        const ssize_t n = ::write(fd, data.data() + written, data.size() - written);
         if (n < 0) {
             if (errno == EINTR) continue;
             return false;
         }
-        data.remove_prefix(static_cast<std::size_t>(n));
+        written += static_cast<std::size_t>(n);
     }
     return true;
+}
+
+bool write_all(int fd, std::string_view data) {
+    std::size_t written = 0;
+    return write_all(fd, data, written);
 }
 
 std::string errno_text() {
@@ -107,6 +116,11 @@ std::size_t BackgroundJobs::pending_fsyncs() const {
     return pending_fsyncs_;
 }
 
+int BackgroundJobs::last_fsync_error() const {
+    std::lock_guard lock(mutex_);
+    return last_fsync_error_;
+}
+
 void BackgroundJobs::wait_idle() {
     std::unique_lock lock(mutex_);
     idle_.wait(lock, [this] { return jobs_.empty() && !busy_; });
@@ -121,14 +135,18 @@ void BackgroundJobs::run() {
         jobs_.pop_front();
         busy_ = true;
         lock.unlock();
+        int error = 0;
         if (job.kind == Kind::fsync) {
-            ::fdatasync(job.fd);
+            if (::fdatasync(job.fd) != 0) error = errno;
         } else {
             ::close(job.fd);
         }
         lock.lock();
         busy_ = false;
-        if (job.kind == Kind::fsync) --pending_fsyncs_;
+        if (job.kind == Kind::fsync) {
+            --pending_fsyncs_;
+            last_fsync_error_ = error;
+        }
         if (jobs_.empty()) idle_.notify_all();
     }
 }
@@ -258,41 +276,79 @@ bool AppendOnlyFile::open(std::string& error) {
 void AppendOnlyFile::append(const Args& command) {
     resp::command(buffer_, command);
     if (child_ > 0) resp::command(rewrite_buffer_, command);
+    ++appended_;
 }
 
-void AppendOnlyFile::flush(std::int64_t now) {
-    if (fd_ < 0) return;
+bool AppendOnlyFile::flush(std::int64_t now) {
+    if (fd_ < 0) return true;
+    if (policy_ == FsyncPolicy::everysec) {
+        // The result of the last background fsync. Under everysec a failed sync does not
+        // hold back replies, but new writes are refused until a sync succeeds again.
+        const int error = jobs_.last_fsync_error();
+        if (error != 0 && sync_ok_)
+            log::error("cannot fsync the append-only file: " + std::string(std::strerror(error)));
+        if (error == 0 && !sync_ok_) log::info("fsync of the append-only file succeeds again");
+        sync_ok_ = error == 0;
+        if (!sync_ok_) write_error_ = std::strerror(error);
+    }
     if (!buffer_.empty()) {
-        if (!write_all(fd_, buffer_)) {
+        std::size_t written = 0;
+        if (!write_all(fd_, buffer_, written)) {
+            const std::string reason = errno_text();
+            if (written > 0) {
+                // A short write left part of a command at the end of the file. Cut the file
+                // back to its last complete command so the retry does not duplicate it; if
+                // that fails, keep the bytes and retry only the rest.
+                if (::ftruncate(fd_, static_cast<off_t>(current_size_)) != 0) {
+                    log::warning("cannot truncate the append-only file after a short write: " + errno_text());
+                    buffer_.erase(0, written);
+                    current_size_ += written;
+                }
+            }
             // Keep the data and retry on the next iteration (for example after ENOSPC).
-            if (last_write_ok_) log::error("cannot write to the append-only file: " + errno_text());
+            // Replies wait until it is written, and new writes are refused meanwhile.
+            if (last_write_ok_) log::error("cannot write to the append-only file: " + reason);
             last_write_ok_ = false;
-            return;
+            write_error_ = reason;
+            return false;
         }
         if (!last_write_ok_) log::info("writes to the append-only file succeed again");
         last_write_ok_ = true;
         current_size_ += buffer_.size();
         buffer_.clear();
         if (policy_ == FsyncPolicy::always) {
-            ::fdatasync(fd_);
+            if (::fdatasync(fd_) != 0) {
+                // The data may not be on disk, and there is no way to tell which part is.
+                // Replying would break the guarantee of `always`, so stop, as Redis does.
+                log::error("cannot fsync the append-only file with appendfsync always: " + errno_text() +
+                           "; exiting without acknowledging the writes");
+                std::_Exit(1);
+            }
             last_fsync_ms_ = now;
-            return;
         }
+        written_ = appended_;
+        if (policy_ == FsyncPolicy::always) return true;
     }
     if (policy_ == FsyncPolicy::everysec && now - last_fsync_ms_ >= 1000 && jobs_.pending_fsyncs() == 0) {
         jobs_.fsync(fd_);
         last_fsync_ms_ = now;
     }
+    return true;
 }
 
-void AppendOnlyFile::sync_now() {
-    if (fd_ < 0) return;
-    if (!buffer_.empty() && write_all(fd_, buffer_)) {
-        current_size_ += buffer_.size();
-        buffer_.clear();
-    }
+bool AppendOnlyFile::sync_now() {
+    if (fd_ < 0) return true;
+    flush(now_ms());
     jobs_.wait_idle();
-    ::fsync(fd_);
+    if (!buffer_.empty()) {
+        log::error("append-only file is missing writes that could not be written: " + write_error_);
+        return false;
+    }
+    if (::fsync(fd_) != 0) {
+        log::error("cannot fsync the append-only file: " + errno_text());
+        return false;
+    }
+    return true;
 }
 
 bool AppendOnlyFile::should_auto_rewrite(int growth_percent, std::uint64_t min_size) const {
@@ -371,8 +427,10 @@ std::string AppendOnlyFile::start_rewrite(const Database& db) {
     if (child_ > 0) return "ERR Background append only file rewriting already in progress";
 
     // Buffered commands describe state already in memory, so they belong to the
-    // snapshot; write them out now so the old file stays complete too.
-    flush(now_ms());
+    // snapshot; write them out now so the old file stays complete too. If they cannot be
+    // written, do not start: they would later reach the new file both in the snapshot
+    // and from the buffer.
+    if (!flush(now_ms())) return "ERR cannot write to the append-only file: " + write_error_;
     rewrite_buffer_.clear();
 
     const pid_t pid = ::fork();
@@ -412,7 +470,8 @@ void AppendOnlyFile::finish_rewrite(pid_t child) {
     const std::string temp = temp_path(child);
     const int fd = ::open(temp.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
     // Commands buffered since the fork are not in the snapshot; append them so the new
-    // file reflects the current dataset before it replaces the old one.
+    // file reflects the current dataset before it replaces the old one. Write them to the
+    // old file too, so it stays complete if the new one cannot be installed.
     flush(now_ms());
     const bool ok = fd >= 0 && write_all(fd, rewrite_buffer_) && ::fsync(fd) == 0 &&
                     ::rename(temp.c_str(), path_.c_str()) == 0;
@@ -431,6 +490,13 @@ void AppendOnlyFile::finish_rewrite(pid_t child) {
     const int old = fd_;
     fd_ = fd;
     jobs_.close(old);
+    // Everything not yet written to the old file was appended after the fork (a rewrite
+    // only starts with an empty buffer), so it is already in the new file through the
+    // rewrite buffer, written and fsynced.
+    buffer_.clear();
+    written_ = appended_;
+    if (!last_write_ok_) log::info("writes to the append-only file succeed again");
+    last_write_ok_ = true;
     current_size_ = base_size_ = static_cast<std::uint64_t>(info.st_size);
     rewrite_buffer_.clear();
     last_rewrite_ok_ = true;

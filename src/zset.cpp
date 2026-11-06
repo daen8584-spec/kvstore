@@ -1,7 +1,10 @@
 #include "zset.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstring>
+#include <random>
 #include <utility>
 
 namespace kv {
@@ -30,14 +33,14 @@ void SkipList::free_node(Node* node) {
     ::operator delete(static_cast<void*>(node));
 }
 
-SkipList::SkipList() : header_(make_node(kMaxLevel, 0, {})) {}
+SkipList::SkipList() : header_(make_node(kInitialHeaderLevel, 0, {})) {}
 
 SkipList::~SkipList() {
     release();
 }
 
 SkipList::SkipList(SkipList&& other) noexcept
-    : header_(std::exchange(other.header_, make_node(kMaxLevel, 0, {}))),
+    : header_(std::exchange(other.header_, make_node(kInitialHeaderLevel, 0, {}))),
       tail_(std::exchange(other.tail_, nullptr)),
       length_(std::exchange(other.length_, 0)),
       level_(std::exchange(other.level_, 1)) {}
@@ -45,7 +48,7 @@ SkipList::SkipList(SkipList&& other) noexcept
 SkipList& SkipList::operator=(SkipList&& other) noexcept {
     if (this != &other) {
         release();
-        header_ = std::exchange(other.header_, make_node(kMaxLevel, 0, {}));
+        header_ = std::exchange(other.header_, make_node(kInitialHeaderLevel, 0, {}));
         tail_ = std::exchange(other.tail_, nullptr);
         length_ = std::exchange(other.length_, 0);
         level_ = std::exchange(other.level_, 1);
@@ -64,11 +67,26 @@ void SkipList::release() {
 }
 
 int SkipList::random_level() {
+    // One generator for every skip list on the thread: a std::mt19937 is about 5 KB of
+    // state, too much to keep per sorted set, and seeding reads the system's entropy
+    // source.
+    thread_local std::mt19937 rng{std::random_device{}()};
     // Each level is kept with probability 1/4, as in Redis, giving an expected 1.33
     // links per node and O(log n) search.
     int level = 1;
-    while (level < kMaxLevel && (rng_() & 0xFFFF) < 0xFFFF / 4) ++level;
+    while (level < kMaxLevel && (rng() & 0xFFFF) < 0xFFFF / 4) ++level;
     return level;
+}
+
+void SkipList::ensure_header_height(int height) {
+    if (height <= header_->height) return;
+    // Nothing points at the header, so it can be moved to a taller allocation.
+    const int grown = std::min(kMaxLevel, std::max(height, header_->height * 2));
+    Node* header = make_node(grown, 0, {});
+    std::memcpy(static_cast<void*>(header->levels()), static_cast<const void*>(header_->levels()),
+                at(header_->height) * sizeof(Level));
+    free_node(header_);
+    header_ = header;
 }
 
 SkipList::Node* SkipList::find_path(double score, std::string_view member, Node** update) const {
@@ -83,6 +101,7 @@ SkipList::Node* SkipList::find_path(double score, std::string_view member, Node*
 }
 
 void SkipList::link(Node* node) {
+    ensure_header_height(node->height);
     Node* update[kMaxLevel];
     std::size_t rank[kMaxLevel];
     Node* cursor = header_;
@@ -259,7 +278,11 @@ std::optional<std::size_t> ZSet::rank(std::string_view member, bool reverse) con
 bool parse_score(std::string_view text, double& score) {
     if (text.empty()) return false;
     std::string_view rest = text;
-    if (rest.front() == '+') rest.remove_prefix(1);
+    if (rest.front() == '+') {
+        rest.remove_prefix(1);
+        // One sign only: "+-5" is not a number.
+        if (rest.empty() || rest.front() == '-' || rest.front() == '+') return false;
+    }
     if (rest == "inf" || rest == "INF" || rest == "Inf") {
         score = INFINITY;
         return true;

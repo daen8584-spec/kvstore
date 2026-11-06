@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <new>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -58,6 +57,9 @@ class SkipList {
     };
 
     static constexpr int kMaxLevel = 32;
+    // The header starts with this many levels and grows as taller nodes are inserted,
+    // so a small sorted set does not pay for a full-height header.
+    static constexpr int kInitialHeaderLevel = 4;
 
     SkipList();
     ~SkipList();
@@ -88,7 +90,8 @@ class SkipList {
   private:
     static Node* make_node(int height, double score, std::string_view member);
     static void free_node(Node* node);
-    int random_level();
+    static int random_level();
+    void ensure_header_height(int height);
     // Finds the predecessors of (score, member) at every level.
     Node* find_path(double score, std::string_view member, Node** update) const;
     void link(Node* node);
@@ -99,7 +102,6 @@ class SkipList {
     Node* tail_ = nullptr;
     std::size_t length_ = 0;
     int level_ = 1;
-    std::mt19937 rng_{std::random_device{}()};
 };
 
 class ZSet {

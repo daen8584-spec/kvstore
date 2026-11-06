@@ -13,7 +13,7 @@ A balanced tree gives ordered access but not ranks without augmenting every node
 
 - Store each sorted set as a hash table from member to score plus a skip list of (score, member) pairs, as Redis does. Ties in score are ordered by the member's bytes.
 - Record on every skip list link the number of nodes it skips (its span). Summing spans along a search path gives a member's rank, and following spans finds the member at a rank, both in O(log n). `ZCOUNT` subtracts the ranks of the first and last members in range instead of walking the range.
-- Promote a node to each next level with probability 1/4, up to 32 levels, as Redis does.
+- Promote a node to each next level with probability 1/4, up to 32 levels, as Redis does. All skip lists share one random number generator, seeded once, and the list header starts with 4 levels and grows as taller nodes are inserted, so an empty sorted set costs a few dozen bytes rather than a generator's 5 KB of state and a full 32-level header.
 - Allocate a node and its links as one block, and let the node refer to the member string owned by the hash table entry, which keeps its address until it is erased. Each member is stored once.
 - Change a score in place when the new score keeps the node between its neighbours, and otherwise unlink and relink the same node without reallocating.
 - Look a member up in the hash table once per `ZADD` element, deciding the new score from the current one in the same lookup.
@@ -23,5 +23,5 @@ A balanced tree gives ordered access but not ranks without augmenting every node
 
 - Every sorted set command runs in O(log n) per element touched, with O(1) score lookups.
 - The first implementation stored members twice, used two allocations per node and two hash lookups per update, and reached 0.70 of Redis's `ZADD` throughput (0.55 with pipelining). The last three decisions above brought it to 0.89 and 0.90 on the same benchmark.
-- Redis encodes small sorted sets as compact listpacks to save memory. kvstore always uses the full structure, so small sorted sets use more memory than in Redis.
+- Redis encodes small sorted sets as compact listpacks to save memory. kvstore always uses the full structure, so small sorted sets use more memory than in Redis. A sorted set with one member takes about 470 bytes of process memory including its key; before the generator was shared and the header made to grow, it took about 5,900.
 - `ZRANGE ... BYLEX` and the lexicographic commands are not implemented.

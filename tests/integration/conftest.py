@@ -12,7 +12,7 @@ import signal
 import socket
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -40,8 +40,9 @@ def free_port() -> int:
 
 
 class Server:
-    def __init__(self, directory: Path, extra: list[str]) -> None:
+    def __init__(self, directory: Path, extra: list[str], preexec: Callable[[], None] | None = None) -> None:
         self.directory = directory
+        self.preexec = preexec
         self.port = free_port()
         self.extra = extra
         self.log = directory / "server.log"
@@ -54,7 +55,7 @@ class Server:
 
     def start(self, expect_failure: bool = False) -> int | None:
         with self.log.open("ab") as log:
-            self.process = subprocess.Popen(self.command_line(), stdout=log, stderr=log)
+            self.process = subprocess.Popen(self.command_line(), stdout=log, stderr=log, preexec_fn=self.preexec)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -89,8 +90,8 @@ class Server:
 def make_server(tmp_path: Path) -> Iterator[object]:
     servers: list[Server] = []
 
-    def factory(*extra: str, start: bool = True) -> Server:
-        server = Server(tmp_path, list(extra))
+    def factory(*extra: str, start: bool = True, preexec: Callable[[], None] | None = None) -> Server:
+        server = Server(tmp_path, list(extra), preexec)
         servers.append(server)
         if start:
             server.start()

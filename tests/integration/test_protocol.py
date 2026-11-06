@@ -57,6 +57,30 @@ def test_unknown_command_and_wrong_arity(client: Client) -> None:
     assert client.call("PING") == "PONG"
 
 
+def test_client_input_in_errors_cannot_inject_replies(client: Client) -> None:
+    # CR and LF from the client would end the error line early and turn the rest into
+    # replies of their own.
+    client.send_raw(encode("x\r\n+OK\r\n:1") + encode("PING"))
+    error = client.read_reply(raise_errors=False)
+    assert isinstance(error, ReplyError)
+    assert "unknown command" in str(error)
+    assert client.read_reply() == "PONG"
+
+    client.send_raw(encode("SET", "k", "v") + encode("EXPIRE", "k", 10, "x\r\n+OK") + encode("PING"))
+    assert client.read_reply() == "OK"
+    error = client.read_reply(raise_errors=False)
+    assert isinstance(error, ReplyError)
+    assert "Unsupported option" in str(error)
+    assert client.read_reply() == "PONG"
+
+
+def test_long_unknown_command_is_not_echoed_in_full(client: Client) -> None:
+    with pytest.raises(ReplyError) as raised:
+        client.call("a" * 100_000, "b" * 100_000, "c" * 100_000)
+    assert len(str(raised.value)) < 400
+    assert client.call("PING") == "PONG"
+
+
 def test_protocol_error_closes_the_connection(client: Client) -> None:
     client.send_raw(b"*1\r\n$abc\r\n")
     with pytest.raises(ReplyError, match="Protocol error"):

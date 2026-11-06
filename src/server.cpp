@@ -242,10 +242,12 @@ void Server::process_input(Client& client) {
         if (client.args.empty()) continue;
 
         ExecContext ctx{db_, client.out, now_ms(), this};
+        if (aof_ && !aof_->accepting_writes()) ctx.write_error = &aof_->write_error();
         const std::vector<Args> records = execute(ctx, client.args);
         ++total_commands_;
-        if (aof_) {
+        if (aof_ && !records.empty()) {
             for (const Args& record : records) aof_->append(record);
+            client.aof_position = aof_->appended();
         }
         if (ctx.close_connection) client.close_after_reply = true;
     }
@@ -335,6 +337,11 @@ void Server::close_client(Client& client) {
 
 void Server::before_sleep() {
     if (aof_) aof_->flush(now_ms());
+    // A client whose last write is not yet in the append-only file (the write failed, for
+    // example on a full disk) keeps its replies until a later flush succeeds; the write
+    // is retried on every iteration, at least once per cron tick. Other clients are
+    // served meanwhile.
+    std::vector<int> held;
     // Writing replies can resume paused clients, whose new replies are queued again.
     while (!pending_writes_.empty()) {
         std::vector<int> batch;
@@ -344,9 +351,17 @@ void Server::before_sleep() {
             if (it == clients_.end()) continue;
             Client& client = *it->second;
             client.queued_for_write = false;
+            if (aof_ && client.aof_position > aof_->written()) {
+                held.push_back(fd);
+                continue;
+            }
             write_output(client);
         }
         if (aof_ && !pending_writes_.empty()) aof_->flush(now_ms());
+    }
+    for (int fd : held) {
+        auto it = clients_.find(fd);
+        if (it != clients_.end()) queue_write(*it->second);
     }
 }
 
@@ -370,8 +385,7 @@ void Server::cron() {
 void Server::shutdown() {
     before_sleep();
     if (aof_) {
-        aof_->sync_now();
-        log::info("append-only file synced");
+        if (aof_->sync_now()) log::info("append-only file synced");
     }
     log::info("shutdown complete");
 }

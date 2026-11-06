@@ -107,16 +107,29 @@ ParseStatus RequestParser::parse_inline(std::string_view input, std::size_t& off
     return ParseStatus::complete;
 }
 
-void simple_string(std::string& out, std::string_view value) {
-    out += '+';
-    out += value;
+namespace {
+
+// A status or error line ends at the first CR or LF, so either inside the text would end
+// the reply early and let the rest be read as further replies. Replaced with spaces, as
+// Redis does.
+void line(std::string& out, char type, std::string_view text) {
+    out += type;
+    const std::size_t start = out.size();
+    out += text;
+    for (std::size_t i = start; i < out.size(); ++i) {
+        if (out[i] == '\r' || out[i] == '\n') out[i] = ' ';
+    }
     out += "\r\n";
 }
 
+}  // namespace
+
+void simple_string(std::string& out, std::string_view value) {
+    line(out, '+', value);
+}
+
 void error(std::string& out, std::string_view message) {
-    out += '-';
-    out += message;
-    out += "\r\n";
+    line(out, '-', message);
 }
 
 void integer(std::string& out, std::int64_t value) {

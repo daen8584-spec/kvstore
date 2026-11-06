@@ -5,7 +5,7 @@ Both servers run on the same machine with the same persistence settings, and eac
 runs against one server at a time. Results are printed as a Markdown table and written
 as JSON to bench/results/.
 
-    python3 bench/compare.py --binary build-release/kvstore --requests 1000000
+    python3 bench/compare.py --binary build/kvstore --requests 1000000
 
 On machines with cores of different speeds (big.LITTLE phones and tablets), the scheduler
 can place either server on a slow core for one test and a fast one for the next, which
@@ -109,7 +109,7 @@ def run_benchmark(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--binary", default="build-release/kvstore")
+    parser.add_argument("--binary", default="build/kvstore", help="a Release build, as in the README")
     parser.add_argument("--tests", default="set,get,incr,lpush,lpop,hset,zadd,zpopmin")
     parser.add_argument("--requests", type=int, default=500_000)
     parser.add_argument("--clients", type=int, default=50)

@@ -118,6 +118,11 @@ TEST("scores parse and format like Redis") {
     CHECK(!kv::parse_score("nan", score));
     CHECK(!kv::parse_score("1.5x", score));
     CHECK(!kv::parse_score("", score));
+    CHECK(!kv::parse_score("+-5", score));
+    CHECK(!kv::parse_score("++5", score));
+    CHECK(!kv::parse_score("+-inf", score));
+    CHECK(!kv::parse_score("+", score));
+    CHECK(kv::parse_score("+5", score) && score == 5);
     CHECK(kv::parse_score_bound("(5", score, exclusive) && exclusive && score == 5);
     CHECK(kv::parse_score_bound("5", score, exclusive) && !exclusive);
 
@@ -126,4 +131,19 @@ TEST("scores parse and format like Redis") {
     CHECK_EQ(kv::format_score(-2.5), std::string("-2.5"));
     CHECK_EQ(kv::format_score(INFINITY), std::string("inf"));
     CHECK_EQ(kv::format_score(-INFINITY), std::string("-inf"));
+}
+
+TEST("an empty skip list is small and grows its header with the list") {
+    // No per-list random generator or full-height header.
+    CHECK(sizeof(kv::SkipList) <= 64);
+    kv::SkipList list;
+    std::vector<std::string> members;
+    members.reserve(20000);
+    for (int i = 0; i < 20000; ++i) members.push_back("m" + std::to_string(i));
+    for (int i = 0; i < 20000; ++i) list.insert(i, members[static_cast<std::size_t>(i)]);
+    CHECK_EQ(list.size(), std::size_t{20000});
+    CHECK_EQ(list.rank(12345, members[12345]), std::size_t{12346});
+    const auto* node = list.at_rank(19999);
+    REQUIRE(node != nullptr);
+    CHECK(node->member == "m19998");
 }

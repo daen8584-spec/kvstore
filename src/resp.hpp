@@ -48,6 +48,7 @@ class RequestParser {
 };
 
 // Reply encoding. Each function appends to `out`.
+// CR and LF in the text are replaced with spaces, so the line is always one reply.
 void simple_string(std::string& out, std::string_view value);
 void error(std::string& out, std::string_view message);
 void integer(std::string& out, std::int64_t value);

@@ -6,6 +6,11 @@
 // commands of an event loop iteration have been written to the file (and, with the
 // `always` policy, flushed to disk), so a client never sees a success for a write
 // that a crash could lose under the configured policy.
+//
+// When a write fails (for example, the disk is full), the commands stay buffered and
+// are retried on every event loop iteration; replies wait until they are written, and
+// new write commands are refused with a MISCONF error, as in Redis. A failed fsync
+// under `always` stops the server, since the writes cannot be acknowledged.
 
 #include <sys/types.h>
 
@@ -39,6 +44,8 @@ class BackgroundJobs {
     void fsync(int fd);
     void close(int fd);
     std::size_t pending_fsyncs() const;
+    // errno of the most recent fsync job, or 0 if it succeeded.
+    int last_fsync_error() const;
     void wait_idle();
 
   private:
@@ -54,6 +61,7 @@ class BackgroundJobs {
     std::condition_variable idle_;
     std::deque<Job> jobs_;
     std::size_t pending_fsyncs_ = 0;
+    int last_fsync_error_ = 0;
     bool busy_ = false;
     bool stopping_ = false;
     std::thread worker_;
@@ -81,12 +89,16 @@ class AppendOnlyFile {
 
     bool open(std::string& error);
     void append(const Args& command);
+    // Commands appended so far, and how many of them have been written to the file.
+    std::uint64_t appended() const { return appended_; }
+    std::uint64_t written() const { return written_; }
 
     // Writes buffered commands and applies the fsync policy. Called once per event loop
-    // iteration, before replies are sent.
-    void flush(std::int64_t now_ms);
+    // iteration, before replies are sent. Returns false if buffered commands could not
+    // be written; their replies must not be sent yet.
+    bool flush(std::int64_t now_ms);
     // Writes and fsyncs synchronously. Used at shutdown.
-    void sync_now();
+    bool sync_now();
 
     // Compaction: a child process writes the current dataset as a minimal sequence of
     // commands while the parent keeps serving and buffers new writes; the parent then
@@ -99,7 +111,10 @@ class AppendOnlyFile {
     std::uint64_t current_size() const { return current_size_; }
     std::uint64_t base_size() const { return base_size_; }
     bool last_rewrite_ok() const { return last_rewrite_ok_; }
-    bool last_write_ok() const { return last_write_ok_; }
+    bool last_write_ok() const { return last_write_ok_ && sync_ok_; }
+    // False while writes or (under everysec) fsyncs fail; write commands are refused.
+    bool accepting_writes() const { return last_write_ok_ && sync_ok_; }
+    const std::string& write_error() const { return write_error_; }
     std::uint64_t rewrites() const { return rewrites_; }
     FsyncPolicy policy() const { return policy_; }
 
@@ -121,6 +136,10 @@ class AppendOnlyFile {
     std::int64_t rewrite_started_ms_ = 0;
     bool last_rewrite_ok_ = true;
     bool last_write_ok_ = true;
+    bool sync_ok_ = true;
+    std::uint64_t appended_ = 0;
+    std::uint64_t written_ = 0;
+    std::string write_error_;
     std::uint64_t rewrites_ = 0;
 };
 
