@@ -1,0 +1,14 @@
+# Runs kvstore with append-only persistence in a named volume.
+# The port is published on the loopback interface only: kvstore has no authentication.
+services:
+  kvstore:
+    build: .
+    image: kvstore:local
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - kvstore-data:/data
+    restart: unless-stopped
+
+volumes:
+  kvstore-data:

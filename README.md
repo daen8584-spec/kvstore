@@ -135,6 +135,15 @@ redis-cli -p 6379 SET greeting hello EX 60
 redis-cli -p 6379 GET greeting
 ```
 
+### With Docker
+
+```bash
+docker compose up -d --build
+redis-cli -p 6379 PING
+```
+
+The container runs with persistence enabled and stores its append-only file in the `kvstore-data` volume. The port is published on `127.0.0.1` only. CI builds the image, starts it, and checks that data survives a container restart.
+
 ### Options
 
 | Option | Default | Description |
