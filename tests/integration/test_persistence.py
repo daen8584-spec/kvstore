@@ -182,17 +182,28 @@ def test_failed_append_holds_the_reply_and_refuses_writes(make_server) -> None: 
         assert aof.stat().st_size == size  # the short write was cut back
 
         # Space becomes available: the held write goes through and is acknowledged.
+        # Raising another process's limit is not permitted everywhere (Android denies
+        # it); there the test checks the restart below instead.
         assert server.process is not None
         unlimited = (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
-        resource.prlimit(server.process.pid, resource.RLIMIT_FSIZE, unlimited)
-        assert writer.read_reply() == "OK"
-        assert "aof_last_write_status:ok" in other.call("INFO", "persistence")
-        assert other.call("SET", "after", "1") == "OK"
+        try:
+            resource.prlimit(server.process.pid, resource.RLIMIT_FSIZE, unlimited)
+            recovered = True
+        except PermissionError:
+            recovered = False
+        if recovered:
+            assert writer.read_reply() == "OK"
+            assert "aof_last_write_status:ok" in other.call("INFO", "persistence")
+            assert other.call("SET", "after", "1") == "OK"
 
+    # Restarting without the limit loads a file with no partial command in it.
     server.preexec = None
     server.restart()
     with server.client() as c:
         assert c.call("GET", "small") == "1"
-        assert c.call("STRLEN", "big") == 8000
-        assert c.call("GET", "after") == "1"
         assert c.call("EXISTS", "refused") == 0
+        if recovered:
+            assert c.call("STRLEN", "big") == 8000
+            assert c.call("GET", "after") == "1"
+        else:
+            assert c.call("EXISTS", "big") == 0  # never acknowledged, never written
