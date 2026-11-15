@@ -9,6 +9,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_set>
 
 #include "glob.hpp"
 #include "resp.hpp"
@@ -167,31 +168,55 @@ void cmd_keys(ExecContext& ctx, const Args& args) {
     for (std::string_view key : matched) resp::bulk(ctx.out, key);
 }
 
-void cmd_scan(ExecContext& ctx, const Args& args) {
-    std::uint64_t cursor = 0;
-    {
-        const std::string& text = args[1];
-        auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), cursor);
-        if (ec != std::errc{} || ptr != text.data() + text.size()) {
-            return resp::error(ctx.out, "ERR invalid cursor");
-        }
-    }
+bool parse_cursor(const std::string& text, std::uint64_t& cursor) {
+    auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), cursor);
+    return ec == std::errc{} && ptr == text.data() + text.size();
+}
+
+struct ScanOptions {
     std::string_view pattern;
     std::string_view type;
     std::int64_t count = 10;
-    for (std::size_t i = 2; i < args.size(); ++i) {
-        if (i + 1 >= args.size()) return resp::error(ctx.out, kSyntax);
+};
+
+// Parses MATCH, COUNT and (for SCAN) TYPE from args[first...]. Writes an error and
+// returns false on invalid options.
+bool parse_scan_options(ExecContext& ctx, const Args& args, std::size_t first, bool allow_type,
+                        ScanOptions& options) {
+    for (std::size_t i = first; i < args.size(); ++i) {
+        if (i + 1 >= args.size()) {
+            resp::error(ctx.out, kSyntax);
+            return false;
+        }
         if (iequals(args[i], "match")) {
-            pattern = args[++i];
+            options.pattern = args[++i];
         } else if (iequals(args[i], "count")) {
-            if (!parse_int(args[++i], count)) return resp::error(ctx.out, kNotInteger);
-            if (count < 1) return resp::error(ctx.out, kSyntax);
-        } else if (iequals(args[i], "type")) {
-            type = args[++i];
+            if (!parse_int(args[++i], options.count)) {
+                resp::error(ctx.out, kNotInteger);
+                return false;
+            }
+            if (options.count < 1) {
+                resp::error(ctx.out, kSyntax);
+                return false;
+            }
+        } else if (allow_type && iequals(args[i], "type")) {
+            options.type = args[++i];
         } else {
-            return resp::error(ctx.out, kSyntax);
+            resp::error(ctx.out, kSyntax);
+            return false;
         }
     }
+    return true;
+}
+
+void cmd_scan(ExecContext& ctx, const Args& args) {
+    std::uint64_t cursor = 0;
+    if (!parse_cursor(args[1], cursor)) return resp::error(ctx.out, "ERR invalid cursor");
+    ScanOptions options;
+    if (!parse_scan_options(ctx, args, 2, true, options)) return;
+    const std::string_view pattern = options.pattern;
+    const std::string_view type = options.type;
+    const std::int64_t count = options.count;
 
     std::vector<std::string> found;
     // Like Redis, COUNT bounds the work per call rather than the result size: each call
@@ -596,6 +621,365 @@ void cmd_hexists(ExecContext& ctx, const Args& args) {
     resp::integer(ctx.out, hash->find(args[2]) ? 1 : 0);
 }
 
+// ---- sets ----
+
+constexpr std::string_view kNotPositive = "ERR value is out of range, must be positive";
+
+// SRANDMEMBER with a negative count may repeat members, so the size of its reply is not
+// bounded by the data. Redis accepts counts up to 2^63 - 1 and stalls building such a
+// reply; kvstore refuses negative counts beyond this.
+constexpr std::int64_t kMaxRandomMembers = 1 << 20;
+
+// Members per SADD or SREM command written to the append-only file.
+constexpr std::size_t kPropagateBatch = 64;
+
+// Finds the set at key. Returns nullptr when the key is missing or holds another type; in
+// the second case it writes WRONGTYPE and sets `wrong`.
+Set* find_set(ExecContext& ctx, const std::string& key, bool& wrong) {
+    Value* value = ctx.db.find(key, ctx.now);
+    wrong = false;
+    if (!value) return nullptr;
+    auto* set = std::get_if<Set>(value);
+    if (!set) {
+        wrong = true;
+        resp::error(ctx.out, kWrongType);
+    }
+    return set;
+}
+
+void reply_members(std::string& out, const Set& set) {
+    resp::array_header(out, set.size());
+    set.for_each([&](const std::string& member, const SetMember&) { resp::bulk(out, member); });
+}
+
+// Records `verb key members...` in the append-only file, in batches.
+void propagate_members(ExecContext& ctx, std::string_view verb, const std::string& key,
+                       const std::vector<std::string>& members) {
+    for (std::size_t i = 0; i < members.size(); i += kPropagateBatch) {
+        Args command{std::string(verb), key};
+        const std::size_t end = std::min(members.size(), i + kPropagateBatch);
+        command.insert(command.end(), members.begin() + static_cast<std::ptrdiff_t>(i),
+                       members.begin() + static_cast<std::ptrdiff_t>(end));
+        ctx.propagate.push_back(std::move(command));
+    }
+}
+
+void cmd_sadd(ExecContext& ctx, const Args& args) {
+    bool wrong = false;
+    Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    if (!set) set = &std::get<Set>(ctx.db.set(args[1], Value{Set{}}));
+    std::int64_t added = 0;
+    for (std::size_t i = 2; i < args.size(); ++i) added += set->try_emplace(args[i]).second ? 1 : 0;
+    ctx.dirty = added > 0;
+    resp::integer(ctx.out, added);
+}
+
+void cmd_srem(ExecContext& ctx, const Args& args) {
+    bool wrong = false;
+    Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    if (!set) return resp::integer(ctx.out, 0);
+    std::int64_t removed = 0;
+    for (std::size_t i = 2; i < args.size(); ++i) removed += set->erase(args[i]) ? 1 : 0;
+    if (set->empty()) ctx.db.erase(args[1]);
+    ctx.dirty = removed > 0;
+    resp::integer(ctx.out, removed);
+}
+
+void cmd_scard(ExecContext& ctx, const Args& args) {
+    bool wrong = false;
+    const Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    resp::integer(ctx.out, set ? static_cast<std::int64_t>(set->size()) : 0);
+}
+
+void cmd_sismember(ExecContext& ctx, const Args& args) {
+    bool wrong = false;
+    const Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    resp::integer(ctx.out, set && set->find(args[2]) ? 1 : 0);
+}
+
+void cmd_smismember(ExecContext& ctx, const Args& args) {
+    bool wrong = false;
+    const Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    resp::array_header(ctx.out, args.size() - 2);
+    for (std::size_t i = 2; i < args.size(); ++i) resp::integer(ctx.out, set && set->find(args[i]) ? 1 : 0);
+}
+
+void cmd_smembers(ExecContext& ctx, const Args& args) {
+    bool wrong = false;
+    const Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    if (!set) return resp::array_header(ctx.out, 0);
+    reply_members(ctx.out, *set);
+}
+
+// SPOP chooses members at random, so it is recorded in the append-only file as the SREM
+// of the members it removed, which replays identically.
+void cmd_spop(ExecContext& ctx, const Args& args) {
+    if (args.size() > 3) return resp::error(ctx.out, kSyntax);
+    const bool with_count = args.size() == 3;
+    std::int64_t count = 1;
+    if (with_count && (!parse_int(args[2], count) || count < 0)) return resp::error(ctx.out, kNotPositive);
+    bool wrong = false;
+    Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    if (!set) return with_count ? resp::array_header(ctx.out, 0) : resp::null_bulk(ctx.out);
+
+    std::vector<std::string> popped;
+    if (static_cast<std::uint64_t>(count) >= set->size()) {
+        popped.reserve(set->size());
+        set->for_each([&](const std::string& member, const SetMember&) { popped.push_back(member); });
+        ctx.db.erase(args[1]);
+        ctx.propagate = {{"DEL", args[1]}};
+    } else {
+        popped.reserve(static_cast<std::size_t>(count));
+        for (std::int64_t i = 0; i < count; ++i) {
+            popped.push_back(set->random_entry(ctx.db.rng())->key);
+            set->erase(popped.back());
+        }
+        propagate_members(ctx, "SREM", args[1], popped);
+    }
+    ctx.dirty = !popped.empty();
+    if (!with_count) return resp::bulk(ctx.out, popped.front());
+    resp::array_header(ctx.out, popped.size());
+    for (const std::string& member : popped) resp::bulk(ctx.out, member);
+}
+
+void cmd_srandmember(ExecContext& ctx, const Args& args) {
+    if (args.size() > 3) return resp::error(ctx.out, kSyntax);
+    const bool with_count = args.size() == 3;
+    std::int64_t count = 1;
+    if (with_count) {
+        if (!parse_int(args[2], count)) return resp::error(ctx.out, kNotInteger);
+        if (count < -kMaxRandomMembers) {
+            return resp::error(ctx.out, "ERR value is out of range, value must between " +
+                                            std::to_string(-kMaxRandomMembers) + " and " +
+                                            std::to_string(std::numeric_limits<std::int64_t>::max()));
+        }
+    }
+    bool wrong = false;
+    Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    if (!set) return with_count ? resp::array_header(ctx.out, 0) : resp::null_bulk(ctx.out);
+    auto& rng = ctx.db.rng();
+    if (!with_count) return resp::bulk(ctx.out, set->random_entry(rng)->key);
+
+    if (count < 0) {
+        // Members may repeat.
+        resp::array_header(ctx.out, static_cast<std::size_t>(-count));
+        for (std::int64_t i = 0; i < -count; ++i) resp::bulk(ctx.out, set->random_entry(rng)->key);
+        return;
+    }
+    const auto wanted = static_cast<std::uint64_t>(count);
+    if (wanted >= set->size()) return reply_members(ctx.out, *set);
+
+    // Distinct members. When most of the set is wanted, shuffle a copy of the members;
+    // otherwise sample until enough distinct members are found, which takes few retries.
+    std::vector<const std::string*> chosen;
+    chosen.reserve(static_cast<std::size_t>(wanted));
+    if (wanted * 3 > set->size()) {
+        std::vector<const std::string*> all;
+        all.reserve(set->size());
+        set->for_each([&](const std::string& member, const SetMember&) { all.push_back(&member); });
+        for (std::size_t i = 0; i < wanted; ++i) {
+            std::uniform_int_distribution<std::size_t> pick(i, all.size() - 1);
+            std::swap(all[i], all[pick(rng)]);
+            chosen.push_back(all[i]);
+        }
+    } else {
+        std::unordered_set<const std::string*> seen;
+        while (chosen.size() < wanted) {
+            const std::string* member = &set->random_entry(rng)->key;
+            if (seen.insert(member).second) chosen.push_back(member);
+        }
+    }
+    resp::array_header(ctx.out, chosen.size());
+    for (const std::string* member : chosen) resp::bulk(ctx.out, *member);
+}
+
+void cmd_smove(ExecContext& ctx, const Args& args) {
+    Value* source_value = ctx.db.find(args[1], ctx.now);
+    Value* destination_value = ctx.db.find(args[2], ctx.now);
+    if (!source_value) return resp::integer(ctx.out, 0);
+    auto* source = std::get_if<Set>(source_value);
+    if (!source || (destination_value && !std::holds_alternative<Set>(*destination_value))) {
+        return resp::error(ctx.out, kWrongType);
+    }
+    if (source_value == destination_value) return resp::integer(ctx.out, source->find(args[3]) ? 1 : 0);
+    if (!source->erase(args[3])) return resp::integer(ctx.out, 0);
+    if (source->empty()) ctx.db.erase(args[1]);
+    auto& destination = std::get<Set>(ctx.db.find_or_create(args[2], ctx.now, [] { return Value{Set{}}; }));
+    destination.try_emplace(args[3]);
+    ctx.dirty = true;
+    resp::integer(ctx.out, 1);
+}
+
+// Looks up the sets named by args[first, last). A missing key is an empty set (nullptr).
+// Returns false and writes WRONGTYPE if any key holds another type.
+bool find_sets(ExecContext& ctx, const Args& args, std::size_t first, std::size_t last,
+               std::vector<const Set*>& sets) {
+    for (std::size_t i = first; i < last; ++i) {
+        Value* value = ctx.db.find(args[i], ctx.now);
+        if (value && !std::holds_alternative<Set>(*value)) {
+            resp::error(ctx.out, kWrongType);
+            return false;
+        }
+        sets.push_back(value ? &std::get<Set>(*value) : nullptr);
+    }
+    return true;
+}
+
+enum class SetOp { inter, sunion, diff };
+
+// Visits the members of the intersection, union or difference of `sets`. For the
+// intersection, `visit` returns false to stop early.
+template <class F>
+void set_operation(SetOp op, std::vector<const Set*> sets, F&& visit) {
+    if (op == SetOp::inter) {
+        if (sets.empty() || std::find(sets.begin(), sets.end(), nullptr) != sets.end()) return;
+        // Iterate the smallest set and probe the others, smallest first.
+        std::sort(sets.begin(), sets.end(), [](const Set* a, const Set* b) { return a->size() < b->size(); });
+        bool more = true;
+        sets.front()->for_each([&](const std::string& member, const SetMember&) {
+            if (!more) return;
+            for (std::size_t i = 1; i < sets.size(); ++i) {
+                if (!sets[i]->find(member)) return;
+            }
+            more = visit(member);
+        });
+    } else if (op == SetOp::sunion) {
+        Set seen;
+        for (const Set* set : sets) {
+            if (!set) continue;
+            set->for_each([&](const std::string& member, const SetMember&) {
+                if (seen.try_emplace(member).second) visit(member);
+            });
+        }
+    } else {
+        if (sets.empty() || !sets.front()) return;
+        sets.front()->for_each([&](const std::string& member, const SetMember&) {
+            for (std::size_t i = 1; i < sets.size(); ++i) {
+                if (sets[i] && sets[i]->find(member)) return;
+            }
+            visit(member);
+        });
+    }
+}
+
+void set_op_reply(ExecContext& ctx, const Args& args, SetOp op) {
+    std::vector<const Set*> sets;
+    if (!find_sets(ctx, args, 1, args.size(), sets)) return;
+    std::vector<const std::string*> members;
+    set_operation(op, sets, [&](const std::string& member) {
+        members.push_back(&member);
+        return true;
+    });
+    resp::array_header(ctx.out, members.size());
+    for (const std::string* member : members) resp::bulk(ctx.out, *member);
+}
+
+// SINTERSTORE, SUNIONSTORE and SDIFFSTORE. The result replaces the destination, whatever
+// it held, and is recorded in the append-only file as DEL and SADD of the resulting
+// members, so replay does not depend on the source keys still being present.
+void set_op_store(ExecContext& ctx, const Args& args, SetOp op) {
+    std::vector<const Set*> sets;
+    if (!find_sets(ctx, args, 2, args.size(), sets)) return;
+    Set result;
+    std::vector<std::string> members;
+    set_operation(op, sets, [&](const std::string& member) {
+        result.try_emplace(member);
+        members.push_back(member);
+        return true;
+    });
+    const std::string& destination = args[1];
+    if (members.empty()) {
+        if (ctx.db.erase(destination)) {
+            ctx.dirty = true;
+            ctx.propagate = {{"DEL", destination}};
+        }
+        return resp::integer(ctx.out, 0);
+    }
+    ctx.db.set(destination, Value{std::move(result)});
+    ctx.propagate = {{"DEL", destination}};
+    propagate_members(ctx, "SADD", destination, members);
+    ctx.dirty = true;
+    resp::integer(ctx.out, static_cast<std::int64_t>(members.size()));
+}
+
+void cmd_sinter(ExecContext& ctx, const Args& args) {
+    set_op_reply(ctx, args, SetOp::inter);
+}
+void cmd_sunion(ExecContext& ctx, const Args& args) {
+    set_op_reply(ctx, args, SetOp::sunion);
+}
+void cmd_sdiff(ExecContext& ctx, const Args& args) {
+    set_op_reply(ctx, args, SetOp::diff);
+}
+void cmd_sinterstore(ExecContext& ctx, const Args& args) {
+    set_op_store(ctx, args, SetOp::inter);
+}
+void cmd_sunionstore(ExecContext& ctx, const Args& args) {
+    set_op_store(ctx, args, SetOp::sunion);
+}
+void cmd_sdiffstore(ExecContext& ctx, const Args& args) {
+    set_op_store(ctx, args, SetOp::diff);
+}
+
+void cmd_sintercard(ExecContext& ctx, const Args& args) {
+    std::int64_t numkeys = 0;
+    if (!parse_int(args[1], numkeys) || numkeys <= 0) {
+        return resp::error(ctx.out, "ERR numkeys should be greater than 0");
+    }
+    if (static_cast<std::uint64_t>(numkeys) > args.size() - 2) {
+        return resp::error(ctx.out, "ERR Number of keys can't be greater than number of args");
+    }
+    const std::size_t last_key = 2 + static_cast<std::size_t>(numkeys);
+    std::int64_t limit = 0;
+    for (std::size_t i = last_key; i < args.size(); ++i) {
+        if (iequals(args[i], "limit") && i + 1 < args.size()) {
+            if (!parse_int(args[++i], limit) || limit < 0)
+                return resp::error(ctx.out, "ERR LIMIT can't be negative");
+        } else {
+            return resp::error(ctx.out, kSyntax);
+        }
+    }
+    std::vector<const Set*> sets;
+    if (!find_sets(ctx, args, 2, last_key, sets)) return;
+    std::int64_t count = 0;
+    set_operation(SetOp::inter, sets, [&](const std::string&) { return ++count != limit; });
+    resp::integer(ctx.out, count);
+}
+
+// SSCAN checks the cursor, then the key, then the options, in the same order as Redis.
+void cmd_sscan(ExecContext& ctx, const Args& args) {
+    std::uint64_t cursor = 0;
+    if (!parse_cursor(args[2], cursor)) return resp::error(ctx.out, "ERR invalid cursor");
+    bool wrong = false;
+    const Set* set = find_set(ctx, args[1], wrong);
+    if (wrong) return;
+    std::vector<const std::string*> found;
+    if (!set) {
+        cursor = 0;
+    } else {
+        ScanOptions options;
+        if (!parse_scan_options(ctx, args, 3, false, options)) return;
+        std::int64_t budget = std::min<std::int64_t>(options.count, 1'000'000) * 10;
+        do {
+            cursor = set->scan(cursor, [&](const std::string& member, const SetMember&) {
+                if (options.pattern.empty() || glob_match(options.pattern, member)) found.push_back(&member);
+            });
+        } while (cursor != 0 && static_cast<std::int64_t>(found.size()) < options.count && --budget > 0);
+    }
+    resp::array_header(ctx.out, 2);
+    resp::bulk(ctx.out, std::to_string(cursor));
+    resp::array_header(ctx.out, found.size());
+    for (const std::string* member : found) resp::bulk(ctx.out, *member);
+}
+
 // ---- sorted sets ----
 
 constexpr std::string_view kNotFloat = "ERR value is not a valid float";
@@ -960,10 +1344,27 @@ constexpr std::array kCommands = {
     Command{"quit", -1, false, cmd_quit},
     Command{"rpop", -2, true, cmd_rpop},
     Command{"rpush", -3, true, cmd_rpush},
+    Command{"sadd", -3, true, cmd_sadd},
     Command{"scan", -2, false, cmd_scan},
+    Command{"scard", 2, false, cmd_scard},
+    Command{"sdiff", -2, false, cmd_sdiff},
+    Command{"sdiffstore", -3, true, cmd_sdiffstore},
     Command{"select", 2, false, cmd_select},
     Command{"set", -3, true, cmd_set},
+    Command{"sinter", -2, false, cmd_sinter},
+    Command{"sintercard", -3, false, cmd_sintercard},
+    Command{"sinterstore", -3, true, cmd_sinterstore},
+    Command{"sismember", 3, false, cmd_sismember},
+    Command{"smembers", 2, false, cmd_smembers},
+    Command{"smismember", -3, false, cmd_smismember},
+    Command{"smove", 4, true, cmd_smove},
+    Command{"spop", -2, true, cmd_spop},
+    Command{"srandmember", -2, false, cmd_srandmember},
+    Command{"srem", -3, true, cmd_srem},
+    Command{"sscan", -3, false, cmd_sscan},
     Command{"strlen", 2, false, cmd_strlen},
+    Command{"sunion", -2, false, cmd_sunion},
+    Command{"sunionstore", -3, true, cmd_sunionstore},
     Command{"time", 1, false, cmd_time},
     Command{"ttl", 2, false, cmd_ttl},
     Command{"type", 2, false, cmd_type},

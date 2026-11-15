@@ -16,7 +16,10 @@ namespace kv {
 
 using List = std::deque<std::string>;
 using Hash = Dict<std::string>;
-using Value = std::variant<std::string, List, Hash, ZSet>;
+// Set members are the keys of a hash table with no values.
+struct SetMember {};
+using Set = Dict<SetMember>;
+using Value = std::variant<std::string, List, Hash, ZSet, Set>;
 
 const char* type_name(const Value& value);
 
@@ -68,6 +71,9 @@ class Database {
     void rehash_idle(std::chrono::microseconds budget);
 
     const Dict<Value>& keys() const { return keys_; }
+
+    // Random source for commands that choose members at random (SPOP, SRANDMEMBER).
+    std::mt19937_64& rng() { return rng_; }
 
   private:
     bool expired(std::string_view key, std::int64_t now) const;

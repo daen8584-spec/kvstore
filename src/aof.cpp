@@ -415,6 +415,16 @@ bool AppendOnlyFile::write_snapshot(const Database& db, int fd, std::int64_t now
                 }
             }
             if (command.size() > 2) emit(command);
+        } else if (const auto* set = std::get_if<Set>(&value)) {
+            command = {"SADD", key};
+            set->for_each([&](const std::string& member, const SetMember&) {
+                command.push_back(member);
+                if (command.size() == kBatch + 2) {
+                    emit(command);
+                    command.resize(2);
+                }
+            });
+            if (command.size() > 2) emit(command);
         }
         if (when) emit({"PEXPIREAT", key, std::to_string(*when)});
     });
