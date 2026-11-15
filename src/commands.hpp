@@ -7,10 +7,9 @@
 #include <vector>
 
 #include "database.hpp"
+#include "multi.hpp"
 
 namespace kv {
-
-using Args = std::vector<std::string>;
 
 // Operations a command needs from the server beyond the keyspace.
 class ServerControl {
@@ -39,6 +38,10 @@ struct ExecContext {
     // Set while the append-only file cannot be written; write commands are then refused
     // with this reason.
     const std::string* write_error = nullptr;
+    // The client's transaction state and the server's watched keys. Without a session,
+    // MULTI and WATCH are refused.
+    Session* session = nullptr;
+    Watches* watches = nullptr;
 };
 
 struct Command {
@@ -46,13 +49,20 @@ struct Command {
     int arity;  // exact argument count including the name, or -minimum
     bool write;
     void (*handler)(ExecContext&, const Args&);
+    // Keys a write command modifies, for WATCH: args[first_key] to args[last_key] in
+    // steps of key_step, where a negative last_key counts from the end. first_key 0
+    // means the command names no keys.
+    int first_key = 1;
+    int last_key = 1;
+    int key_step = 1;
 };
 
 const Command* find_command(std::string_view name);
 std::size_t command_count();
 
-// Executes one command and writes its reply to ctx.out. Returns the commands to append to
-// the append-only file (empty when nothing changed).
+// Executes one command, or queues it inside MULTI, and writes its reply to ctx.out.
+// Returns the commands to append to the append-only file (empty when nothing changed).
+// A transaction is returned wrapped in MULTI and EXEC.
 std::vector<Args> execute(ExecContext& ctx, const Args& args);
 
 }  // namespace kv

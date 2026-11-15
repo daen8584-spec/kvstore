@@ -80,6 +80,60 @@ def test_truncated_tail_is_discarded(make_server) -> None:  # type: ignore[no-un
     assert "truncating" in server.log.read_text()
 
 
+def test_transactions_are_logged_between_multi_and_exec(make_server) -> None:  # type: ignore[no-untyped-def]
+    server = make_server(*AOF)
+    with server.client() as c:
+        c.call("MULTI")
+        c.call("SET", "a", "1")
+        c.call("GET", "a")
+        c.call("SADD", "s", "x", "y")
+        c.call("SPOP", "s")
+        assert c.call("EXEC")[0] == "OK"
+        # A transaction that changes nothing is not logged.
+        c.call("MULTI")
+        c.call("GET", "a")
+        c.call("EXEC")
+        members = c.call("SMEMBERS", "s")
+    server.stop()
+    text = (server.directory / "appendonly.aof").read_bytes()
+    assert text.count(b"MULTI") == 1 and text.count(b"EXEC") == 1
+    assert text.index(b"MULTI") < text.index(b"SREM") < text.index(b"EXEC")
+    server.start()
+    with server.client() as c:
+        assert c.call("GET", "a") == "1"
+        assert c.call("SMEMBERS", "s") == members
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$4\r\nhalf\r\n$1\r\n1\r\n",  # no EXEC
+        b"*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$4\r\nhalf\r\n$1\r\n1\r\n*1\r\n$4\r\nEX",  # EXEC cut off
+    ],
+)
+def test_transaction_cut_off_at_the_end_is_discarded(make_server, tail: bytes) -> None:  # type: ignore[no-untyped-def]
+    server = make_server(*AOF)
+    with server.client() as c:
+        c.call("SET", "complete", "yes")
+    server.stop()
+    aof = server.directory / "appendonly.aof"
+    intact = aof.stat().st_size
+    with aof.open("ab") as f:
+        f.write(tail)
+    server.start()
+    with server.client() as c:
+        assert c.call("GET", "complete") == "yes"
+        assert c.call("EXISTS", "half") == 0
+        # The server keeps appending after the truncated transaction.
+        c.call("SET", "later", "1")
+    assert aof.stat().st_size > intact
+    assert "incomplete command or transaction" in server.log.read_text()
+    server.restart()
+    with server.client() as c:
+        assert c.call("GET", "later") == "1"
+        assert c.call("EXISTS", "half") == 0
+
+
 def test_corruption_inside_the_file_prevents_startup(make_server) -> None:  # type: ignore[no-untyped-def]
     server = make_server(*AOF)
     with server.client() as c:

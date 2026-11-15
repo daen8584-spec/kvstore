@@ -68,6 +68,7 @@ class Server final : public ServerControl {
         // Position in the append-only file of this client's last write. Its replies are
         // sent only once the file has been written up to there.
         std::uint64_t aof_position = 0;
+        Session session;
     };
 
     bool setup(std::string& error);
@@ -85,6 +86,7 @@ class Server final : public ServerControl {
 
     Config config_;
     Database db_;
+    Watches watches_;
     BackgroundJobs jobs_;
     std::unique_ptr<AppendOnlyFile> aof_;
 

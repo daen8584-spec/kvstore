@@ -980,6 +980,68 @@ void cmd_sscan(ExecContext& ctx, const Args& args) {
     for (const std::string* member : found) resp::bulk(ctx.out, *member);
 }
 
+// ---- transactions ----
+
+std::vector<Args> run(ExecContext& ctx, const Command& command, const Args& args);
+
+void cmd_multi(ExecContext& ctx, const Args&) {
+    if (!ctx.session) return resp::error(ctx.out, "ERR MULTI is not available here");
+    if (ctx.session->in_multi) return resp::error(ctx.out, "ERR MULTI calls can not be nested");
+    ctx.session->in_multi = true;
+    ctx.out += resp::kOk;
+}
+
+void cmd_discard(ExecContext& ctx, const Args&) {
+    if (!ctx.session || !ctx.session->in_multi) return resp::error(ctx.out, "ERR DISCARD without MULTI");
+    ctx.session->end_multi();
+    if (ctx.watches) ctx.watches->unwatch_all(*ctx.session);
+    ctx.out += resp::kOk;
+}
+
+void cmd_watch(ExecContext& ctx, const Args& args) {
+    if (!ctx.session || !ctx.watches) return resp::error(ctx.out, "ERR WATCH is not available here");
+    if (ctx.session->in_multi) return resp::error(ctx.out, "ERR WATCH inside MULTI is not allowed");
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        ctx.watches->watch(*ctx.session, args[i], ctx.db.find(args[i], ctx.now) != nullptr);
+    }
+    ctx.out += resp::kOk;
+}
+
+void cmd_unwatch(ExecContext& ctx, const Args&) {
+    if (ctx.session && ctx.watches) ctx.watches->unwatch_all(*ctx.session);
+    ctx.out += resp::kOk;
+}
+
+// Runs the queued commands one after another; nothing else runs in between because the
+// server is single-threaded. A command that fails at run time (WRONGTYPE, for example)
+// returns its error in the reply array and the others still run: there is no rollback,
+// as in Redis. The writes are recorded in the append-only file between MULTI and EXEC,
+// so a file that ends inside a transaction is replayed without it.
+void cmd_exec(ExecContext& ctx, const Args&) {
+    Session* session = ctx.session;
+    if (!session || !session->in_multi) return resp::error(ctx.out, "ERR EXEC without MULTI");
+    const std::vector<Args> queued = std::move(session->queued);
+    const bool aborted = session->queue_error;
+    const bool watched_changed = session->watch_dirty || watched_key_vanished(*session, ctx.db, ctx.now);
+    session->end_multi();
+    if (ctx.watches) ctx.watches->unwatch_all(*session);
+    if (aborted) return resp::error(ctx.out, "EXECABORT Transaction discarded because of previous errors.");
+    if (watched_changed) return resp::null_array(ctx.out);
+
+    resp::array_header(ctx.out, queued.size());
+    std::vector<Args> records;
+    for (const Args& args : queued) {
+        // Commands were looked up and checked for arity when they were queued.
+        for (Args& record : run(ctx, *find_command(args[0]), args)) records.push_back(std::move(record));
+    }
+    if (!records.empty()) {
+        records.insert(records.begin(), Args{"MULTI"});
+        records.push_back(Args{"EXEC"});
+    }
+    ctx.propagate = std::move(records);
+    ctx.dirty = !ctx.propagate.empty();
+}
+
 // ---- sorted sets ----
 
 constexpr std::string_view kNotFloat = "ERR value is not a valid float";
@@ -1312,13 +1374,15 @@ constexpr std::array kCommands = {
     Command{"dbsize", 1, false, cmd_dbsize},
     Command{"decr", 2, true, cmd_decr},
     Command{"decrby", 3, true, cmd_decrby},
-    Command{"del", -2, true, cmd_del},
+    Command{"del", -2, true, cmd_del, 1, -1, 1},
+    Command{"discard", 1, false, cmd_discard, 0},
     Command{"echo", 2, false, cmd_echo},
+    Command{"exec", 1, false, cmd_exec, 0},
     Command{"exists", -2, false, cmd_exists},
     Command{"expire", -3, true, cmd_expire},
     Command{"expireat", -3, true, cmd_expireat},
-    Command{"flushall", -1, true, cmd_flushall},
-    Command{"flushdb", -1, true, cmd_flushall},
+    Command{"flushall", -1, true, cmd_flushall, 0},
+    Command{"flushdb", -1, true, cmd_flushall, 0},
     Command{"get", 2, false, cmd_get},
     Command{"hdel", -3, true, cmd_hdel},
     Command{"hexists", 3, false, cmd_hexists},
@@ -1335,7 +1399,8 @@ constexpr std::array kCommands = {
     Command{"lpush", -3, true, cmd_lpush},
     Command{"lrange", 4, false, cmd_lrange},
     Command{"mget", -2, false, cmd_mget},
-    Command{"mset", -3, true, cmd_mset},
+    Command{"mset", -3, true, cmd_mset, 1, -1, 2},
+    Command{"multi", 1, false, cmd_multi, 0},
     Command{"persist", 2, true, cmd_persist},
     Command{"pexpire", -3, true, cmd_pexpire},
     Command{"pexpireat", -3, true, cmd_pexpireat},
@@ -1357,7 +1422,7 @@ constexpr std::array kCommands = {
     Command{"sismember", 3, false, cmd_sismember},
     Command{"smembers", 2, false, cmd_smembers},
     Command{"smismember", -3, false, cmd_smismember},
-    Command{"smove", 4, true, cmd_smove},
+    Command{"smove", 4, true, cmd_smove, 1, 2, 1},
     Command{"spop", -2, true, cmd_spop},
     Command{"srandmember", -2, false, cmd_srandmember},
     Command{"srem", -3, true, cmd_srem},
@@ -1368,7 +1433,9 @@ constexpr std::array kCommands = {
     Command{"time", 1, false, cmd_time},
     Command{"ttl", 2, false, cmd_ttl},
     Command{"type", 2, false, cmd_type},
-    Command{"unlink", -2, true, cmd_del},
+    Command{"unlink", -2, true, cmd_del, 1, -1, 1},
+    Command{"unwatch", 1, false, cmd_unwatch, 0},
+    Command{"watch", -2, false, cmd_watch, 0},
     Command{"zadd", -4, true, cmd_zadd},
     Command{"zcard", 2, false, cmd_zcard},
     Command{"zcount", 4, false, cmd_zcount},
@@ -1408,7 +1475,44 @@ std::size_t command_count() {
     return kCommands.size();
 }
 
+namespace {
+
+// Commands that act on the transaction itself, or on the connection, run immediately
+// inside MULTI instead of being queued.
+bool runs_inside_multi(const Command& command) {
+    return command.handler == cmd_multi || command.handler == cmd_exec || command.handler == cmd_discard ||
+           command.handler == cmd_watch || command.handler == cmd_quit;
+}
+
+void touch_written_keys(ExecContext& ctx, const Command& command, const Args& args) {
+    if (!ctx.watches || command.first_key == 0) return;
+    const auto count = static_cast<int>(args.size());
+    const int last = command.last_key < 0 ? count + command.last_key : command.last_key;
+    for (int i = command.first_key; i <= last && i < count; i += command.key_step) {
+        ctx.watches->touch(args[static_cast<std::size_t>(i)]);
+    }
+}
+
+std::vector<Args> run(ExecContext& ctx, const Command& command, const Args& args) {
+    if (command.write && ctx.write_error) {
+        resp::error(ctx.out, "MISCONF Errors writing to the AOF file: " + *ctx.write_error);
+        return {};
+    }
+    if (command.handler == cmd_flushall && ctx.watches) ctx.watches->touch_existing(ctx.db, ctx.now);
+    ctx.dirty = false;
+    ctx.propagate.clear();
+    command.handler(ctx, args);
+    if (!ctx.dirty) return {};
+    if (command.write) touch_written_keys(ctx, command, args);
+    if (!ctx.propagate.empty()) return std::move(ctx.propagate);
+    return command.write ? std::vector<Args>{args} : std::vector<Args>{};
+}
+
+}  // namespace
+
 std::vector<Args> execute(ExecContext& ctx, const Args& args) {
+    Session* session = ctx.session;
+    const bool queueing = session && session->in_multi;
     const Command* command = find_command(args[0]);
     if (command == nullptr) {
         // Client input in the message is capped as in Redis: the name at 128 bytes and
@@ -1419,24 +1523,27 @@ std::vector<Args> execute(ExecContext& ctx, const Args& args) {
         for (std::size_t i = 1; i < args.size() && quoted.size() < kErrorArgLimit; ++i)
             quoted += "'" + clip(args[i], kErrorArgLimit - quoted.size()) + "' ";
         resp::error(ctx.out, message + quoted);
+        if (queueing) session->queue_error = true;
         return {};
     }
     const auto count = static_cast<int>(args.size());
     if ((command->arity > 0 && count != command->arity) || (command->arity < 0 && count < -command->arity)) {
         resp::error(ctx.out,
                     "ERR wrong number of arguments for '" + std::string(command->name) + "' command");
+        if (queueing) session->queue_error = true;
         return {};
     }
-    if (command->write && ctx.write_error) {
-        resp::error(ctx.out, "MISCONF Errors writing to the AOF file: " + *ctx.write_error);
+    if (queueing && !runs_inside_multi(*command)) {
+        if (command->write && ctx.write_error) {
+            resp::error(ctx.out, "MISCONF Errors writing to the AOF file: " + *ctx.write_error);
+            session->queue_error = true;
+            return {};
+        }
+        session->queued.push_back(args);
+        resp::simple_string(ctx.out, "QUEUED");
         return {};
     }
-    ctx.dirty = false;
-    ctx.propagate.clear();
-    command->handler(ctx, args);
-    if (!command->write || !ctx.dirty) return {};
-    if (ctx.propagate.empty()) return {args};
-    return std::move(ctx.propagate);
+    return run(ctx, *command, args);
 }
 
 }  // namespace kv

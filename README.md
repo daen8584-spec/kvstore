@@ -9,7 +9,8 @@ Its behaviour is checked against Redis itself: the protocol and command tests pa
 ## Features
 
 - **Redis protocol (RESP2)**, including pipelining and inline commands, with limits on request sizes
-- **Strings, lists, hashes, sets and sorted sets**: 78 commands, including `SET` with all its options, `SCAN` with `MATCH`, `COUNT` and `TYPE`, `EXPIRE` with `NX`, `XX`, `GT` and `LT`, and `ZADD` and `ZRANGE` with their option sets, and set intersection, union and difference with their `STORE` variants
+- **Strings, lists, hashes, sets and sorted sets**: 83 commands, including `SET` with all its options, `SCAN` with `MATCH`, `COUNT` and `TYPE`, `EXPIRE` with `NX`, `XX`, `GT` and `LT`, and `ZADD` and `ZRANGE` with their option sets, and set intersection, union and difference with their `STORE` variants
+- **Transactions** with `MULTI`, `EXEC`, `DISCARD` and optimistic locking with `WATCH`, logged so that a crash keeps all of a transaction or none of it
 - **Sorted sets** on a skip list with ranked links, giving O(log n) rank, range and count queries
 - **Single-threaded epoll event loop** with no locks on the data path, fair reading across clients and backpressure for clients that do not read their replies
 - **Incremental rehashing**: a resize is spread over many operations instead of stalling one request, and keys are hashed with SipHash-1-3 and a random key against hash flooding
@@ -90,6 +91,12 @@ Memory, measured as the growth of the server's resident memory: a set of 1,000,0
 
 The 13 set integration tests pass against kvstore and Redis 7.0.15, except one `kvstore_only` test for the `SRANDMEMBER` limit described under *Limitations*.
 
+### Transactions
+
+The 24 transaction integration tests pass against kvstore and Redis 7.0.15. They cover queueing and run-time errors, `EXECABORT`, `WATCH` with writes from other clients, writes that change nothing, expiry, `FLUSHALL` and the `STORE` commands, and isolation from other clients.
+
+`WATCH` adds a cost to every write while any key is watched. On the 4-vCPU machine, with 10,000 watched keys and pipelined `SET`, throughput was 0.89 to 0.97 of the throughput with no watched keys (median 0.94), measured in one server process, alternating, median of 7 runs. The first version reached 0.81 to 0.86: looking up the watched keys on every write missed the CPU cache. A small bit filter in front of the lookup closed most of the gap; see [0009](docs/adr/0009-transactions.md).
+
 ## Architecture
 
 ```mermaid
@@ -122,6 +129,7 @@ Documented as [Architecture Decision Records](docs/adr/README.md):
 - [0006](docs/adr/0006-verification.md) Testing against Redis, sanitizers and fuzzing
 - [0007](docs/adr/0007-sorted-sets.md) Sorted sets on a hash table and a ranked skip list
 - [0008](docs/adr/0008-sets.md) Sets on the existing hash table, with random and derived writes logged as their effect
+- [0009](docs/adr/0009-transactions.md) Transactions in the event loop, `WATCH` through key positions, and a filter that keeps it cheap
 
 ## Commands
 
@@ -132,6 +140,7 @@ Documented as [Architecture Decision Records](docs/adr/README.md):
 | Hashes | `HSET` `HGET` `HDEL` `HGETALL` `HLEN` `HEXISTS` |
 | Sets | `SADD` `SREM` `SCARD` `SISMEMBER` `SMISMEMBER` `SMEMBERS` `SPOP` `SRANDMEMBER` (with count) `SMOVE` `SINTER` `SUNION` `SDIFF` `SINTERSTORE` `SUNIONSTORE` `SDIFFSTORE` `SINTERCARD` (`LIMIT`) `SSCAN` (`MATCH` `COUNT`) |
 | Sorted sets | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZINCRBY` `ZSCORE` `ZCARD` `ZREM` `ZRANK` `ZREVRANK` `ZRANGE` (`BYSCORE` `REV` `LIMIT` `WITHSCORES`) `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZCOUNT` `ZPOPMIN` `ZPOPMAX` |
+| Transactions | `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `TTL` `PTTL` `PERSIST` |
 | Server | `PING` `ECHO` `QUIT` `SELECT 0` `DBSIZE` `FLUSHALL` `FLUSHDB` `INFO` `CONFIG GET` `COMMAND` `TIME` `BGREWRITEAOF` |
 
@@ -200,7 +209,7 @@ cd tests/integration && python3 -m pytest          # end-to-end tests against th
 KVSTORE_TARGET=redis python3 -m pytest             # the same tests against redis-server
 ```
 
-Integration tests need Python 3 with pytest. They start the server on a free port per test and talk RESP over TCP with a minimal client in `tests/integration/resp_client.py`, so they control exactly what is sent. They cover partial requests delivered one byte at a time, 10,000 pipelined commands, an 8 MiB binary value, a client that requests 100 MiB of replies before reading any, concurrent clients, protocol errors, expiry with and without access, `SCAN` and `SSCAN` completeness, and persistence: restart, `SIGKILL` recovery, truncated and corrupted files, and writes made during a rewrite.
+Integration tests need Python 3 with pytest. They start the server on a free port per test and talk RESP over TCP with a minimal client in `tests/integration/resp_client.py`, so they control exactly what is sent. They cover partial requests delivered one byte at a time, 10,000 pipelined commands, an 8 MiB binary value, a client that requests 100 MiB of replies before reading any, concurrent clients, protocol errors, expiry with and without access, `SCAN` and `SSCAN` completeness, and persistence: restart, `SIGKILL` recovery, truncated and corrupted files, transactions cut off at the end of the file, and writes made during a rewrite.
 
 Sanitizer and fuzzing builds:
 
@@ -234,6 +243,7 @@ src/
   main.cpp        Command-line options and startup
   server.*        Event loop, connections, backpressure, INFO and CONFIG
   commands.*      Command table and implementations
+  multi.*         Transaction state and the WATCH registry
   database.*      Keyspace, expiry tables, lazy and active expiry
   dict.hpp        Hash table with incremental rehashing and SCAN cursors
   zset.*          Sorted sets: ranked skip list and score parsing
@@ -253,7 +263,7 @@ docs/adr/         Architecture Decision Records
 ## Limitations
 
 - One database (`SELECT 0` only), RESP2 only, and IPv4 only.
-- Not implemented: lexicographic sorted set ranges (`BYLEX`), transactions, publish and subscribe, scripting, replication, clustering, memory limits with eviction, snapshots (RDB) and authentication.
+- Not implemented: lexicographic sorted set ranges (`BYLEX`), publish and subscribe, scripting, replication, clustering, memory limits with eviction, snapshots (RDB) and authentication.
 - Memory is not reported in `INFO`, because the server does not use an instrumented allocator.
 - `SRANDMEMBER` with a negative count accepts counts down to -2^20 (1,048,576). Redis accepts any count and can stop responding while it builds a reply of that size; see [0008](docs/adr/0008-sets.md).
 

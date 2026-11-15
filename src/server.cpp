@@ -242,6 +242,8 @@ void Server::process_input(Client& client) {
         if (client.args.empty()) continue;
 
         ExecContext ctx{db_, client.out, now_ms(), this};
+        ctx.session = &client.session;
+        ctx.watches = &watches_;
         if (aof_ && !aof_->accepting_writes()) ctx.write_error = &aof_->write_error();
         const std::vector<Args> records = execute(ctx, client.args);
         ++total_commands_;
@@ -330,6 +332,8 @@ void Server::update_events(Client& client, std::uint32_t events) {
 
 void Server::close_client(Client& client) {
     const int fd = client.fd;
+    // The watch registry points at the client's session.
+    watches_.unwatch_all(client.session);
     ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
     ::close(fd);
     clients_.erase(fd);  // destroys client

@@ -92,6 +92,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     limits.max_inline_length = 1 << 12;
     kv::resp::RequestParser parser(limits);
     kv::Database db;
+    kv::Session session;
+    kv::Watches watches;
     std::string buffer;
     std::string out;
     std::size_t offset = 0;
@@ -109,6 +111,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             if (!args.empty()) {
                 out.clear();
                 kv::ExecContext ctx{db, out, 1'000'000};
+                ctx.session = &session;
+                ctx.watches = &watches;
                 kv::execute(ctx, args);
                 if (!exactly_one_reply(out)) std::abort();
             }
