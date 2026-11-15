@@ -11,3 +11,4 @@ Each record describes a significant design decision, its context and its consequ
 | [0005](0005-append-only-file.md) | Persist with an append-only file and compact it in a forked child |
 | [0006](0006-verification.md) | Verify behaviour against Redis, under sanitizers and with fuzzing |
 | [0007](0007-sorted-sets.md) | Implement sorted sets with a hash table and a ranked skip list |
+| [0008](0008-sets.md) | Implement sets on the existing hash table, and log random and derived writes as their effect |

@@ -9,7 +9,7 @@ Its behaviour is checked against Redis itself: the protocol and command tests pa
 ## Features
 
 - **Redis protocol (RESP2)**, including pipelining and inline commands, with limits on request sizes
-- **Strings, lists, hashes and sorted sets**: 61 commands, including `SET` with all its options, `SCAN` with `MATCH`, `COUNT` and `TYPE`, `EXPIRE` with `NX`, `XX`, `GT` and `LT`, and `ZADD` and `ZRANGE` with their option sets
+- **Strings, lists, hashes, sets and sorted sets**: 78 commands, including `SET` with all its options, `SCAN` with `MATCH`, `COUNT` and `TYPE`, `EXPIRE` with `NX`, `XX`, `GT` and `LT`, and `ZADD` and `ZRANGE` with their option sets, and set intersection, union and difference with their `STORE` variants
 - **Sorted sets** on a skip list with ranked links, giving O(log n) rank, range and count queries
 - **Single-threaded epoll event loop** with no locks on the data path, fair reading across clients and backpressure for clients that do not read their replies
 - **Incremental rehashing**: a resize is spread over many operations instead of stalling one request, and keys are hashed with SipHash-1-3 and a random key against hash flooding
@@ -75,6 +75,21 @@ The first version of `ZADD` reached 0.70 of Redis (0.55 with pipelining). Alloca
 
 Correctness is checked the same way: the protocol and command integration tests, including 12 for sorted sets, pass against kvstore and Redis 7.0.15. The tests that existed before sorted sets were added also pass against Redis 8.10.3; the sorted set tests have not been run against Redis 8.
 
+### Sets
+
+Measured on 2026-11-15 on a different machine from the tables above: a Linux VM with 4 vCPUs (Intel Xeon, 2.1 GHz), both servers pinned to one CPU and `redis-benchmark` to the other three, against Redis 7.0.15. 200,000 requests per test, 50 clients, median of 3 runs. `SADD` adds random members from a range of 100,000 to one set, which grows to about 86,000 members. `SPOP` then pops from that set until it is empty, so a little more than half of its requests find no set; both servers see the same sequence. `SET` and `HSET` are included as a reference on this machine.
+
+| Test | Redis | kvstore | Ratio | Redis, pipeline 16 | kvstore, pipeline 16 | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SADD | 110,193 | 109,349 | 0.99 | 952,381 | 934,579 | 0.98 |
+| SPOP | 105,042 | 99,850 | 0.95 | 909,091 | 1,000,000 | 1.10 |
+| SET | 119,261 | 120,482 | 1.01 | 626,959 | 576,369 | 0.92 |
+| HSET | 117,302 | 111,173 | 0.95 | 684,932 | 738,007 | 1.08 |
+
+Memory, measured as the growth of the server's resident memory: a set of 1,000,000 members (`member:N`) takes about 73 bytes per member against 66 for Redis, and 100,000 sets with one member take about 283 bytes per set including its key, against 225. Redis 7.0 also stores sets of strings in a hash table, which is why the difference is small; Redis 7.2 and later store small sets more compactly. See [0008](docs/adr/0008-sets.md).
+
+The 13 set integration tests pass against kvstore and Redis 7.0.15, except one `kvstore_only` test for the `SRANDMEMBER` limit described under *Limitations*.
+
 ## Architecture
 
 ```mermaid
@@ -106,6 +121,7 @@ Documented as [Architecture Decision Records](docs/adr/README.md):
 - [0005](docs/adr/0005-append-only-file.md) Append-only file, fsync policies, crash recovery and fork-based compaction
 - [0006](docs/adr/0006-verification.md) Testing against Redis, sanitizers and fuzzing
 - [0007](docs/adr/0007-sorted-sets.md) Sorted sets on a hash table and a ranked skip list
+- [0008](docs/adr/0008-sets.md) Sets on the existing hash table, with random and derived writes logged as their effect
 
 ## Commands
 
@@ -114,6 +130,7 @@ Documented as [Architecture Decision Records](docs/adr/README.md):
 | Strings | `GET` `SET` (`EX` `PX` `EXAT` `PXAT` `NX` `XX` `KEEPTTL` `GET`) `MGET` `MSET` `INCR` `INCRBY` `DECR` `DECRBY` `APPEND` `STRLEN` |
 | Lists | `LPUSH` `RPUSH` `LPOP` `RPOP` (with count) `LLEN` `LRANGE` |
 | Hashes | `HSET` `HGET` `HDEL` `HGETALL` `HLEN` `HEXISTS` |
+| Sets | `SADD` `SREM` `SCARD` `SISMEMBER` `SMISMEMBER` `SMEMBERS` `SPOP` `SRANDMEMBER` (with count) `SMOVE` `SINTER` `SUNION` `SDIFF` `SINTERSTORE` `SUNIONSTORE` `SDIFFSTORE` `SINTERCARD` (`LIMIT`) `SSCAN` (`MATCH` `COUNT`) |
 | Sorted sets | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZINCRBY` `ZSCORE` `ZCARD` `ZREM` `ZRANK` `ZREVRANK` `ZRANGE` (`BYSCORE` `REV` `LIMIT` `WITHSCORES`) `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZCOUNT` `ZPOPMIN` `ZPOPMAX` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `TTL` `PTTL` `PERSIST` |
 | Server | `PING` `ECHO` `QUIT` `SELECT 0` `DBSIZE` `FLUSHALL` `FLUSHDB` `INFO` `CONFIG GET` `COMMAND` `TIME` `BGREWRITEAOF` |
@@ -183,7 +200,7 @@ cd tests/integration && python3 -m pytest          # end-to-end tests against th
 KVSTORE_TARGET=redis python3 -m pytest             # the same tests against redis-server
 ```
 
-Integration tests need Python 3 with pytest. They start the server on a free port per test and talk RESP over TCP with a minimal client in `tests/integration/resp_client.py`, so they control exactly what is sent. They cover partial requests delivered one byte at a time, 10,000 pipelined commands, an 8 MiB binary value, a client that requests 100 MiB of replies before reading any, concurrent clients, protocol errors, expiry with and without access, `SCAN` completeness, and persistence: restart, `SIGKILL` recovery, truncated and corrupted files, and writes made during a rewrite.
+Integration tests need Python 3 with pytest. They start the server on a free port per test and talk RESP over TCP with a minimal client in `tests/integration/resp_client.py`, so they control exactly what is sent. They cover partial requests delivered one byte at a time, 10,000 pipelined commands, an 8 MiB binary value, a client that requests 100 MiB of replies before reading any, concurrent clients, protocol errors, expiry with and without access, `SCAN` and `SSCAN` completeness, and persistence: restart, `SIGKILL` recovery, truncated and corrupted files, and writes made during a rewrite.
 
 Sanitizer and fuzzing builds:
 
@@ -236,8 +253,9 @@ docs/adr/         Architecture Decision Records
 ## Limitations
 
 - One database (`SELECT 0` only), RESP2 only, and IPv4 only.
-- Not implemented: sets, lexicographic sorted set ranges (`BYLEX`), transactions, publish and subscribe, scripting, replication, clustering, memory limits with eviction, snapshots (RDB) and authentication.
+- Not implemented: lexicographic sorted set ranges (`BYLEX`), transactions, publish and subscribe, scripting, replication, clustering, memory limits with eviction, snapshots (RDB) and authentication.
 - Memory is not reported in `INFO`, because the server does not use an instrumented allocator.
+- `SRANDMEMBER` with a negative count accepts counts down to -2^20 (1,048,576). Redis accepts any count and can stop responding while it builds a reply of that size; see [0008](docs/adr/0008-sets.md).
 
 ## License
 

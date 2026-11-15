@@ -10,8 +10,10 @@ const char* type_name(const Value& value) {
             return "list";
         case 2:
             return "hash";
-        default:
+        case 3:
             return "zset";
+        default:
+            return "set";
     }
 }
 

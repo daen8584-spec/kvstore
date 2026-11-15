@@ -146,6 +146,33 @@ def test_sorted_sets_survive_restart_and_rewrite(make_server) -> None:  # type: 
         assert c.call("ZRANGE", "z", 0, -1, "WITHSCORES") == ["low", "-inf", "tenth", "0.1", "a", "3.5"]
 
 
+def test_sets_survive_restart_and_rewrite(make_server) -> None:  # type: ignore[no-untyped-def]
+    # SPOP is random and the STORE commands depend on their sources, so they are logged
+    # as their effect (SREM, DEL and SADD); replay must reproduce the same sets.
+    server = make_server(*AOF, "--auto-aof-rewrite-percentage", "0")
+    with server.client() as c:
+        c.call("SADD", "s", *[f"m{i}" for i in range(200)])
+        c.call("SPOP", "s")
+        c.call("SPOP", "s", 30)
+        c.call("SADD", "other", "m1", "m2", "m3", "x")
+        c.call("SINTERSTORE", "both", "s", "other")
+        c.call("SUNIONSTORE", "all", "s", "other")
+        c.call("SADD", "gone", "a")
+        c.call("SPOP", "gone", 5)
+        c.call("SMOVE", "other", "moved", "x")
+        expected = {key: set(c.call("SMEMBERS", key)) for key in ("s", "other", "both", "all", "moved")}
+    assert len(expected["s"]) == 169
+    for _ in range(2):
+        server.restart()
+        with server.client() as c:
+            assert {key: set(c.call("SMEMBERS", key)) for key in expected} == expected
+            assert c.call("EXISTS", "gone") == 0
+            c.call("BGREWRITEAOF")
+            deadline = time.monotonic() + 10
+            while "aof_rewrite_in_progress:1" in c.call("INFO", "persistence") and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+
 def limit_file_size(limit: int):  # type: ignore[no-untyped-def]
     """Makes writes beyond `limit` bytes fail in the server, like a full disk.
 
