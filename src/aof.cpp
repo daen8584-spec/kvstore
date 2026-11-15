@@ -185,6 +185,11 @@ AofLoadResult AppendOnlyFile::load(const std::string& path, Database& db, const 
     std::uint64_t consumed_before_buffer = 0;  // file bytes discarded from the front of buffer
     Args args;
     std::string scratch;
+    // Commands between MULTI and EXEC are queued and applied together at EXEC, so a file
+    // that ends inside a transaction is truncated to where the transaction started.
+    Session session;
+    Watches watches;
+    std::uint64_t transaction_start = 0;
     char chunk[1 << 16];
     bool eof = false;
 
@@ -216,7 +221,10 @@ AofLoadResult AppendOnlyFile::load(const std::string& path, Database& db, const 
             }
             if (!args.empty()) {
                 scratch.clear();
+                if (!session.in_multi) transaction_start = result.valid_bytes;
                 ExecContext ctx{db, scratch, now_ms()};
+                ctx.session = &session;
+                ctx.watches = &watches;
                 execute(ctx, args);
                 if (!scratch.empty() && scratch.front() == '-') {
                     result.ok = false;
@@ -246,12 +254,16 @@ AofLoadResult AppendOnlyFile::load(const std::string& path, Database& db, const 
         if (eof) break;
     }
     if (parser.in_progress()) result.truncated = true;
+    if (session.in_multi) {
+        result.truncated = true;
+        result.valid_bytes = transaction_start;
+    }
     ::close(fd);
 
     if (result.truncated) {
         struct stat info {};
         const auto size = ::stat(path.c_str(), &info) == 0 ? static_cast<std::uint64_t>(info.st_size) : 0;
-        log::warning("append-only file ends with an incomplete command; truncating from " +
+        log::warning("append-only file ends with an incomplete command or transaction; truncating from " +
                      std::to_string(size) + " to " + std::to_string(result.valid_bytes) + " bytes");
         if (::truncate(path.c_str(), static_cast<off_t>(result.valid_bytes)) != 0) {
             result.ok = false;
